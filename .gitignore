@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.python-version-local
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Data — never commit client trial balances
+data/*.xlsx
+data/*.xlsb
+data/*.xls
+data/*.csv
+data/uploads/
+data/ctb.duckdb
+data/ctb.duckdb.wal
+data/*.parquet
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ruff
+.ruff_cache/
