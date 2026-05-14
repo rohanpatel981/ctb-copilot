@@ -5,6 +5,7 @@ Per-firm column mapping is a v2 problem. If the headers don't match expected
 keywords, ingestion fails loudly rather than silently mis-mapping columns.
 """
 
+import math
 import uuid
 from pathlib import Path
 
@@ -170,6 +171,59 @@ _INSERT_SQL = (
     f"INSERT INTO ctb_data ({', '.join(_INSERT_COLUMNS)}) "
     f"VALUES ({', '.join(['?'] * len(_INSERT_COLUMNS))})"
 )
+_COL_IDX = {name: i for i, name in enumerate(_INSERT_COLUMNS)}
+
+# Columns that should sum to amount_consolidated per row. Excludes
+# amount_functional_ccy because it's in the entity's own currency and would
+# mix currencies if rolled up.
+_RECONCILIATION_COMPONENTS = (
+    "amount_reporting_ccy",
+    "adj_other_consolidated",
+    "adj_nci",
+    "adj_goodwill",
+    "adj_ppa",
+    "adj_intercompany",
+    "adj_investment_capital",
+    "adj_retained_earnings",
+    "adj_fctr",
+)
+
+
+def validate_reconciliation(prepared: list[list], *, abs_tol: float = 0.01, rel_tol: float = 1e-9) -> None:
+    """Verify that amount_consolidated = sum(_RECONCILIATION_COMPONENTS) for every row.
+
+    The CTB satisfies this invariant by construction. A mismatch usually means
+    the file was hand-edited in Excel, the consolidation producer has a bug,
+    or the upload was the wrong artifact (caught earlier by header validation).
+
+    Uses math.isclose so floating-point drift on large values is tolerated;
+    real arithmetic errors (≥0.01 INR for typical magnitudes) are flagged.
+    """
+    failures: list[tuple[int, float, float, float]] = []
+    component_indices = [_COL_IDX[c] for c in _RECONCILIATION_COMPONENTS]
+    actual_idx = _COL_IDX["amount_consolidated"]
+    row_num_idx = _COL_IDX["row_number"]
+
+    for record in prepared:
+        computed = sum((record[i] or 0.0) for i in component_indices)
+        actual = record[actual_idx] or 0.0
+        if not math.isclose(actual, computed, abs_tol=abs_tol, rel_tol=rel_tol):
+            failures.append((record[row_num_idx], actual, computed, actual - computed))
+
+    if failures:
+        examples = "\n  ".join(
+            f"Excel row {r}: actual={a:,.2f}, computed={c:,.2f}, diff={d:,.2f}"
+            for r, a, c, d in failures[:5]
+        )
+        more = f"\n  ...and {len(failures) - 5} more failing rows" if len(failures) > 5 else ""
+        raise IngestError(
+            f"Reconciliation check failed: {len(failures)} of {len(prepared)} rows where "
+            f"amount_consolidated != amount_reporting_ccy + Σ(adj_*). "
+            "The consolidated TB should satisfy this invariant by construction — a mismatch "
+            "usually means the file was hand-edited, the consolidation producer has a bug, "
+            "or some columns carry an unexpected meaning. Sample failing rows:\n  "
+            f"{examples}{more}"
+        )
 
 
 def ingest_file(
@@ -216,6 +270,8 @@ def ingest_file(
                 else:
                     record.append(_coerce_numeric(raw))
             prepared.append(record)
+
+        validate_reconciliation(prepared)
 
         with rw_connection(db_path) as conn:
             conn.execute("UPDATE ingestions SET status='inserting' WHERE id=?", [upload_id])
