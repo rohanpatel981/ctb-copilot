@@ -81,18 +81,74 @@ def _coerce_numeric(v) -> float | None:
         return None
 
 
+_AMOUNT_KEYWORDS = (
+    "amount in functional",
+    "amount in consolidation",
+    "amount in reporting",
+    "debit",
+    "credit",
+    "closing balance",
+)
+_ADJUSTMENT_KEYWORDS = (
+    "consolidated adjustments",
+    "non controlling",
+    "intercompany elimination",
+    "purchase price allocation",
+)
+
+
+def _detect_artifact_type(headers: list[str]) -> str:
+    """Heuristic classification of what an Excel file probably is.
+
+    Used to turn schema mismatches into informative error messages so users
+    know *why* their file was rejected and what to upload instead.
+    """
+    joined = " | ".join((h or "").lower() for h in headers)
+    has_amounts = any(kw in joined for kw in _AMOUNT_KEYWORDS)
+    has_adjustments = any(kw in joined for kw in _ADJUSTMENT_KEYWORDS)
+    has_entity_gl_code = "entity gl code" in joined
+
+    if has_entity_gl_code and not has_amounts:
+        return "mapping_table"
+    if has_amounts and not has_adjustments:
+        return "entity_trial_balance"
+    if has_amounts and has_adjustments:
+        return "ctb_variant"
+    return "unknown"
+
+
 def validate_headers(headers: list[str]) -> None:
+    artifact = _detect_artifact_type(headers)
+
     if len(headers) < 22:
+        if artifact == "mapping_table":
+            raise IngestError(
+                f"This looks like a chart-of-accounts mapping table ({len(headers)} columns; no amount columns detected). "
+                "Mapping tables describe how entity-level accounts map to consolidated codes — useful as reference, but "
+                "they don't contain the numbers needed for Q&A. ctb-copilot ingests the consolidated trial balance with "
+                "amounts (typically a 22-column 'Consolidated TB - Detailed' export). Did you mean to upload that?"
+            )
+        if artifact == "entity_trial_balance":
+            raise IngestError(
+                f"This looks like an entity-level trial balance ({len(headers)} columns; has amount columns but no "
+                "consolidation adjustments). ctb-copilot ingests the *consolidated* TB — the output of the consolidation "
+                "process, which adds columns for NCI, goodwill, intercompany eliminations, FCTR, etc. (22 columns total). "
+                "Did you mean to upload the consolidated TB instead?"
+            )
         raise IngestError(
-            f"Expected at least 22 columns, got {len(headers)}. "
-            "Is this a consolidated TB in the expected format?"
+            f"Expected at least 22 columns in the Consolidated TB layout, got {len(headers)}. "
+            "ctb-copilot ingests the consolidated trial balance ('Consolidated TB - Detailed' export). "
+            "See the README → 'Expected CTB format' for the canonical 22-column layout. "
+            "Support for variant CTB shapes is on the roadmap."
         )
+
     for idx, keyword in HEADER_KEYWORDS:
         actual = (headers[idx] or "").lower()
         if keyword.lower() not in actual:
             raise IngestError(
-                f"Header column {idx} expected to contain {keyword!r}, got {headers[idx]!r}. "
-                "File schema does not match the expected CTB layout."
+                f"Column {idx + 1} (header: {headers[idx]!r}) doesn't match the expected CTB layout — "
+                f"expected a column containing {keyword!r}. The file has the right number of columns "
+                "but their order or names differ. See README → 'Expected CTB format'."
             )
 
 
