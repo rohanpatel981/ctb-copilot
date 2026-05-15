@@ -13,6 +13,7 @@ import httpx
 import streamlit as st
 
 from ctb_copilot.config import settings
+from ctb_copilot.export import export_filename, query_result_to_xlsx
 
 API = settings.api_base_url
 TIMEOUT = httpx.Timeout(120.0)
@@ -123,7 +124,7 @@ def render_upload() -> None:
             st.error(f"Upload failed: {e}. {detail}")
 
 
-def render_answer(result: dict) -> None:
+def render_answer(result: dict, index: int = 0) -> None:
     """Render a single QueryResult dict from POST /query."""
     st.markdown(f"**You** · {result['question']}")
     st.markdown(f"**Assistant** &nbsp;&nbsp; {_confidence_badge(result['confidence'])}")
@@ -168,14 +169,27 @@ def render_answer(result: dict) -> None:
         else:
             st.caption("No rows to show.")
 
+    try:
+        xlsx_bytes = query_result_to_xlsx(result)
+        st.download_button(
+            "📄 Export to Excel",
+            data=xlsx_bytes,
+            file_name=export_filename(result.get("question")),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"export-{index}",
+            help="Download answer + SQL + source rows as a 3-sheet .xlsx for working papers.",
+        )
+    except Exception as e:
+        st.caption(f"Export unavailable: {e}")
+
 
 def render_chat() -> None:
     if "chat" not in st.session_state:
         st.session_state.chat = []  # list[dict] of QueryResult shapes
 
     st.subheader("Ask a question")
-    for entry in st.session_state.chat:
-        render_answer(entry)
+    for i, entry in enumerate(st.session_state.chat):
+        render_answer(entry, index=i)
         st.divider()
 
     question = st.chat_input("What's the YoY change in current liabilities?")
