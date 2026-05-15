@@ -32,6 +32,7 @@ dev = [
 [project.scripts]
 ctb-api = "ctb_copilot.api:run"
 ctb-ui = "ctb_copilot.ui:run"
+ctb-eval = "ctb_copilot.eval.runner:run"
 
 [build-system]
 requires = ["hatchling"]

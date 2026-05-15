@@ -1,0 +1,107 @@
+# Golden Q&A pairs for ctb-copilot.
+#
+# Each case is a question plus a set of structural and (where verified)
+# numerical expectations about the SQL Claude generates and the result rows
+# DuckDB returns. Designed against the sample CTB ingested under FY 2024-25.
+#
+# Prerequisite: the sample CTB must be ingested with period = 'FY 2024-25'
+# in the local DuckDB before running the eval.
+#
+# Expected values came from manual verification on 2026-05-13 against the
+# real sample-ctb.xlsx (2,686 rows, 13 entities, after dedup cleanup).
+
+- id: total_assets_fy24
+  question: "What's the total of assets for FY 2024-25?"
+  description: Simple aggregate by fs_category, default amount column.
+  checks:
+    sql_contains: [ctb_data, fs_category, Assets, "FY 2024-25", amount_consolidated]
+    sql_not_contains: ["ABS(", DROP, DELETE, UPDATE, INSERT]
+    post_process: none
+    confidence_min: medium
+    first_row_total_approx:
+      value: 272564694.79
+      abs_tol: 100.0
+  notes: Verified 2026-05-13; assets positive per TB convention.
+
+- id: total_liabilities_fy24
+  question: "What's the total liabilities for FY 2024-25?"
+  description: Should select fs_category='Liabilities', sum amount_consolidated.
+  checks:
+    sql_contains: [fs_category, Liabilities, "FY 2024-25"]
+    sql_not_contains: ["ABS(", DROP, DELETE]
+    post_process: none
+    confidence_min: medium
+  notes: Liabilities are negative per TB convention.
+
+- id: total_revenue_fy24
+  question: "What's the total revenue for FY 2024-25?"
+  checks:
+    sql_contains: [fs_category, Revenue, "FY 2024-25"]
+    sql_not_contains: ["ABS(", DROP]
+    post_process: none
+    confidence_min: medium
+  notes: Revenue negative per TB convention.
+
+- id: current_liabilities_fy24
+  question: "What's the total current liabilities for FY 2024-25?"
+  description: Should pick bs_classification='Current liabilities', not fs_category.
+  checks:
+    sql_contains: [bs_classification, "Current liabilities", "FY 2024-25"]
+    sql_not_contains: ["ABS(", DROP]
+    post_process: none
+    confidence_min: medium
+
+- id: revenue_by_entity_fy24
+  question: "Total revenue by entity for FY 2024-25"
+  description: Should GROUP BY entity_code or entity_name; ~13 entities.
+  checks:
+    sql_contains: [fs_category, Revenue, "FY 2024-25", "GROUP BY"]
+    sql_not_contains: ["ABS(", DROP]
+    post_process: none
+    row_count_min: 5
+    row_count_max: 20
+    confidence_min: medium
+
+- id: goodwill_adjustment_fy24
+  question: "How much goodwill adjustment is on the consolidated balance sheet for FY 2024-25?"
+  description: Should target adj_goodwill column, filter to Balance Sheet rows.
+  checks:
+    sql_contains: [adj_goodwill, "FY 2024-25"]
+    sql_not_contains: ["ABS(", DROP]
+    post_process: none
+    confidence_min: low
+
+- id: intercompany_eliminations_fy24
+  question: "What was the total intercompany elimination for FY 2024-25?"
+  checks:
+    sql_contains: [adj_intercompany, "FY 2024-25"]
+    sql_not_contains: ["ABS(", DROP]
+    post_process: none
+    confidence_min: low
+
+- id: assets_one_entity_fy24
+  question: "What are the total assets for entity GCC7 in FY 2024-25?"
+  description: Should filter by entity_code='GCC7' AND fs_category='Assets'.
+  checks:
+    sql_contains: [GCC7, fs_category, Assets, "FY 2024-25"]
+    sql_not_contains: ["ABS(", DROP]
+    post_process: none
+    confidence_min: medium
+
+- id: decompose_assets_fy24
+  question: "Decompose the consolidated assets figure for FY 2024-25 — show me the reporting amount and each consolidation adjustment."
+  description: Tests the reconciliation invariant; should select multiple component columns.
+  checks:
+    sql_contains: [fs_category, Assets, "FY 2024-25", amount_reporting_ccy, adj_intercompany]
+    sql_not_contains: ["ABS(", DROP]
+    post_process: none
+    confidence_min: low
+
+- id: ambiguous_currency_question
+  question: "How much cash do we have?"
+  description: Ambiguous (no period, no entity, vague). Should hedge confidence to low/medium and surface assumptions in explanation.
+  checks:
+    sql_contains: [ctb_data]
+    sql_not_contains: [DROP, DELETE]
+    confidence_min: low
+  notes: This is intentionally underspecified; we want low/medium confidence + a SELECT that exposes context rather than a confident wrong number.
