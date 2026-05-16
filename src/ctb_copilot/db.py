@@ -11,8 +11,7 @@ from typing import Iterator
 
 import duckdb
 
-CANONICAL_DDL = """
-CREATE TABLE IF NOT EXISTS ctb_data (
+_CTB_DATA_COLUMNS = """
     upload_id              VARCHAR NOT NULL,
     row_number             INTEGER NOT NULL,
     period                 VARCHAR NOT NULL,
@@ -38,11 +37,19 @@ CREATE TABLE IF NOT EXISTS ctb_data (
     adj_retained_earnings  DOUBLE,
     adj_fctr               DOUBLE,
     amount_consolidated    DOUBLE
-);
+"""
+
+CANONICAL_DDL = f"""
+CREATE TABLE IF NOT EXISTS ctb_data ({_CTB_DATA_COLUMNS});
 
 CREATE INDEX IF NOT EXISTS idx_ctb_period ON ctb_data(period);
 CREATE INDEX IF NOT EXISTS idx_ctb_fs_category ON ctb_data(fs_category);
 CREATE INDEX IF NOT EXISTS idx_ctb_entity_code ON ctb_data(entity_code);
+
+-- Sync writes here first; on success an atomic swap moves rows into
+-- ctb_data so queries during a long sync see the OLD period's data
+-- intact, then flip to the new data only on commit.
+CREATE TABLE IF NOT EXISTS ctb_data_staging ({_CTB_DATA_COLUMNS});
 
 CREATE TABLE IF NOT EXISTS ingestions (
     id              VARCHAR PRIMARY KEY,
