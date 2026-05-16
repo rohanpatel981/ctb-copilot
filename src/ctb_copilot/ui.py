@@ -9,6 +9,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+import json
+import time
+
 import httpx
 import streamlit as st
 
@@ -47,6 +50,79 @@ def _fmt_number(val) -> str:
 
 def _confidence_badge(conf: str) -> str:
     return {"high": "🟢 High", "medium": "🟡 Medium", "low": "🔴 Low"}.get(conf, conf)
+
+
+def render_docdb_sync() -> None:
+    """Sidebar section for DocumentDB sync. Hidden if not configured in .env."""
+    cfg = _api_safe("GET", "/sync/config")
+    if not cfg or not cfg.get("configured"):
+        return
+
+    with st.sidebar:
+        with st.expander("🔄 Sync from DocumentDB", expanded=False):
+            st.caption(f"Source: `{cfg['database']}.{cfg['collection']}`")
+
+            period = st.selectbox(
+                "Period to sync",
+                options=FY_OPTIONS,
+                index=FY_OPTIONS.index(DEFAULT_FY),
+                key="sync-period",
+                help="Will be sent as the value of the configured period field.",
+            )
+
+            filter_preview = dict(cfg.get("default_filter") or {})
+            if cfg.get("period_field"):
+                filter_preview[cfg["period_field"]] = period
+            if cfg.get("reporting_period") and cfg.get("reporting_period_field"):
+                filter_preview[cfg["reporting_period_field"]] = cfg["reporting_period"]
+
+            with st.expander("Filter preview", expanded=False):
+                st.code(json.dumps(filter_preview, indent=2), language="json")
+
+            if st.button("🚀 Sync now", key="sync-trigger", type="primary"):
+                try:
+                    with httpx.Client(timeout=TIMEOUT) as client:
+                        r = client.post(f"{API}/sync", json={"period": period, "filter_override": {}})
+                        r.raise_for_status()
+                        resp = r.json()
+                    st.session_state["active_sync_id"] = resp["sync_id"]
+                    st.session_state["active_sync_period"] = period
+                    st.rerun()
+                except httpx.HTTPError as e:
+                    detail = ""
+                    try:
+                        detail = e.response.json().get("detail", "") if e.response else ""
+                    except Exception:
+                        pass
+                    st.error(f"Sync request failed: {e}. {detail}")
+
+            active_id = st.session_state.get("active_sync_id")
+            if active_id:
+                status = _api_safe("GET", f"/sync/{active_id}")
+                if status:
+                    s = status.get("status")
+                    rows = status.get("row_count")
+                    period_lbl = status.get("period")
+                    if s in ("pending", "running"):
+                        prog_text = f"Syncing **{period_lbl}**"
+                        if rows:
+                            prog_text += f" — {rows:,} rows so far…"
+                        else:
+                            prog_text += " — starting up…"
+                        st.info(prog_text)
+                        st.progress(0)  # indeterminate; actual % needs a known total
+                        time.sleep(2)
+                        st.rerun()
+                    elif s == "done":
+                        st.success(f"✓ Synced {rows:,} rows for {period_lbl}")
+                        if st.button("Dismiss", key="dismiss-done"):
+                            st.session_state.pop("active_sync_id", None)
+                            st.rerun()
+                    elif s == "failed":
+                        st.error(f"Sync failed: {status.get('error') or 'unknown error'}")
+                        if st.button("Dismiss", key="dismiss-failed"):
+                            st.session_state.pop("active_sync_id", None)
+                            st.rerun()
 
 
 def render_sidebar() -> None:
@@ -215,6 +291,7 @@ def main() -> None:
     st.set_page_config(page_title="ctb-copilot", layout="wide", page_icon="📊")
     st.title("ctb-copilot")
     st.caption("Q&A over consolidated trial balance Excel files. Every answer shows its SQL and source rows.")
+    render_docdb_sync()
     render_sidebar()
     render_upload()
     st.divider()
