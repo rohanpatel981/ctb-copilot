@@ -1,0 +1,128 @@
+"""DocumentDBSource — pull canonical-shape TB rows from AWS DocumentDB.
+
+DocumentDB speaks the Mongo wire protocol, so pymongo is the right client.
+We open a cursor with batch_size=BATCH_SIZE, yield batches of docs already
+shaped to the canonical column names, and the orchestrator handles the
+DuckDB insert + atomic swap.
+
+Field naming assumption (v0.3): the source collection's field names already
+match the canonical names (consol_gl_code, fs_category, amount_consolidated,
+etc.). The customer's TB does match for our first user; for the next user
+whose schema differs, we'll add a `field_mapping` env var that translates
+their names to canonical names before yielding. v0.4.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Iterator
+
+from pymongo import MongoClient
+
+from ctb_copilot.ports.source import DatabaseSource, SyncProgress
+
+BATCH_SIZE = 10_000
+
+# Canonical fields the orchestrator expects in each yielded row. Same set
+# as INSERT columns in ingest.py minus the three provenance columns
+# (upload_id, row_number, period).
+CANONICAL_FIELDS: tuple[str, ...] = (
+    "consol_gl_code",
+    "consol_gl_description",
+    "entity_name",
+    "entity_code",
+    "gl_nature",
+    "fs_category",
+    "bs_classification",
+    "fsli",
+    "grouping",
+    "sub_grouping",
+    "functional_currency",
+    "amount_functional_ccy",
+    "amount_reporting_ccy",
+    "adj_other_consolidated",
+    "adj_nci",
+    "adj_goodwill",
+    "adj_ppa",
+    "adj_intercompany",
+    "adj_investment_capital",
+    "adj_retained_earnings",
+    "adj_fctr",
+    "amount_consolidated",
+)
+
+
+def build_filter(
+    *,
+    default_filter: dict[str, Any],
+    period: str,
+    period_field: str,
+    reporting_period_field: str | None = None,
+    reporting_period: str | None = None,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge the static + variable + override filter components into the
+    final dict passed to pymongo `find()`.
+
+    Priority (later wins): default_filter < period filter < reporting period
+    < overrides. Returns a fresh dict; never mutates inputs.
+    """
+    merged: dict[str, Any] = dict(default_filter or {})
+    merged[period_field] = period
+    if reporting_period and reporting_period_field:
+        merged[reporting_period_field] = reporting_period
+    if overrides:
+        merged.update(overrides)
+    return merged
+
+
+def _project_doc(doc: dict[str, Any]) -> dict[str, Any]:
+    """Pick only the canonical fields out of a source document.
+
+    Anything extra (e.g. Mongo's _id, audit fields, client-specific columns)
+    is dropped silently. If a canonical field is missing, the row gets None
+    for that key and the reconciliation check downstream will surface any
+    structural problems.
+    """
+    return {field: doc.get(field) for field in CANONICAL_FIELDS}
+
+
+class DocumentDBSource(DatabaseSource):
+    """pymongo-backed implementation of DatabaseSource for AWS DocumentDB."""
+
+    def __init__(self, uri: str, database: str, collection: str) -> None:
+        self.uri = uri
+        self.database = database
+        self.collection_name = collection
+
+    def stream_rows(
+        self,
+        *,
+        filter_doc: dict[str, Any],
+        batch_size: int = BATCH_SIZE,
+        progress: SyncProgress | None = None,
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Open a cursor against `find(filter_doc)` and yield batches of
+        canonical-shape row dicts.
+
+        Connection is opened on first iteration and closed when iteration
+        completes or the generator is closed. Server-side cursor is
+        paginated by batch_size so we never materialize all docs at once.
+        """
+        client = MongoClient(self.uri)
+        try:
+            collection = client[self.database][self.collection_name]
+            cursor = collection.find(filter_doc, batch_size=batch_size)
+            batch: list[dict[str, Any]] = []
+            for doc in cursor:
+                batch.append(_project_doc(doc))
+                if len(batch) >= batch_size:
+                    if progress is not None:
+                        progress.report(len(batch))
+                    yield batch
+                    batch = []
+            if batch:
+                if progress is not None:
+                    progress.report(len(batch))
+                yield batch
+        finally:
+            client.close()
