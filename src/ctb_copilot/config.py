@@ -1,6 +1,8 @@
+import json
 from pathlib import Path
+from typing import Any
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -16,6 +18,31 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = 8000
     api_base_url: str = "http://127.0.0.1:8000"
+
+    # --- DocumentDB sync (optional) ---
+    docdb_uri: str | None = None
+    docdb_database: str | None = None
+    docdb_collection: str | None = None
+    docdb_default_filter: dict[str, Any] = Field(default_factory=dict)
+    docdb_period_field: str | None = None
+    docdb_reporting_period: str | None = None
+    docdb_reporting_period_field: str = "reporting_period_id"
+
+    @field_validator("docdb_default_filter", mode="before")
+    @classmethod
+    def _parse_filter_json(cls, v: Any) -> Any:
+        """Allow DOCDB_DEFAULT_FILTER to come in as either a JSON string from
+        env or a dict from another source."""
+        if v is None or v == "":
+            return {}
+        if isinstance(v, str):
+            return json.loads(v)
+        return v
+
+    @property
+    def docdb_configured(self) -> bool:
+        """True iff the minimum DocumentDB env vars are set."""
+        return bool(self.docdb_uri and self.docdb_database and self.docdb_collection and self.docdb_period_field)
 
 
 settings = Settings()

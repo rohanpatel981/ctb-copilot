@@ -45,16 +45,25 @@ CREATE INDEX IF NOT EXISTS idx_ctb_fs_category ON ctb_data(fs_category);
 CREATE INDEX IF NOT EXISTS idx_ctb_entity_code ON ctb_data(entity_code);
 
 CREATE TABLE IF NOT EXISTS ingestions (
-    id           VARCHAR PRIMARY KEY,
-    filename     VARCHAR,
-    period       VARCHAR,
-    status       VARCHAR NOT NULL,
-    row_count    INTEGER,
-    error        VARCHAR,
-    uploaded_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP
+    id              VARCHAR PRIMARY KEY,
+    filename        VARCHAR,
+    period          VARCHAR,
+    status          VARCHAR NOT NULL,
+    row_count       INTEGER,
+    error           VARCHAR,
+    uploaded_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at    TIMESTAMP,
+    source_type     VARCHAR DEFAULT 'excel',
+    source_metadata JSON
 );
 """
+
+# Migrations applied to pre-existing databases. DuckDB silently ignores
+# columns that already exist, so this is idempotent.
+_MIGRATIONS = (
+    "ALTER TABLE ingestions ADD COLUMN IF NOT EXISTS source_type VARCHAR DEFAULT 'excel'",
+    "ALTER TABLE ingestions ADD COLUMN IF NOT EXISTS source_metadata JSON",
+)
 
 # The DDL shown to the LLM (without indexes; columns only). Kept distinct from
 # CANONICAL_DDL because the LLM doesn't need to know about indexes or the
@@ -94,6 +103,8 @@ def init_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(str(path)) as conn:
         conn.execute(CANONICAL_DDL)
+        for stmt in _MIGRATIONS:
+            conn.execute(stmt)
 
 
 @contextmanager
