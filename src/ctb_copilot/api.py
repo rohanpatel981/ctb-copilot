@@ -5,20 +5,24 @@ here when you ship S3 / Bedrock adapters — every call site in `query.py` and
 `ingest.py` depends on the Protocol, not the concrete class.
 """
 
+import json
 import uuid
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ctb_copilot.adapters.llm_anthropic import AnthropicLLM
+from ctb_copilot.adapters.source_docdb import DocumentDBSource, build_filter
 from ctb_copilot.adapters.storage_local import LocalDiskStorage
 from ctb_copilot.config import settings
 from ctb_copilot.db import LLM_SCHEMA_DDL, init_db, ro_connection, rw_connection
 from ctb_copilot.ingest import ingest_file
 from ctb_copilot.query import QueryResult, UnsafeSQLError, run_query
+from ctb_copilot.sync import SyncError, run_sync
 
 storage = LocalDiskStorage(settings.storage_dir)
 llm = AnthropicLLM(api_key=settings.anthropic_api_key, model=settings.anthropic_model)
@@ -49,6 +53,27 @@ class IngestionStatus(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
+
+
+class SyncRequest(BaseModel):
+    period: str
+    filter_override: dict[str, Any] = Field(default_factory=dict)
+
+
+class SyncResponse(BaseModel):
+    sync_id: str
+    status: str
+    filter_applied: dict[str, Any]
+
+
+class DocDBConfigResponse(BaseModel):
+    configured: bool
+    database: str | None = None
+    collection: str | None = None
+    default_filter: dict[str, Any] = Field(default_factory=dict)
+    period_field: str | None = None
+    reporting_period: str | None = None
+    reporting_period_field: str | None = None
 
 
 def _run_ingestion_bg(db_path: Path, source_path: Path, upload_id: str, period: str, original_filename: str) -> None:
@@ -166,6 +191,86 @@ async def query(req: QueryRequest) -> QueryResult:
         return await run_query(question=req.question, llm=llm, db_path=settings.duckdb_path)
     except UnsafeSQLError as e:
         raise HTTPException(400, f"Generated SQL rejected by safety check: {e}") from e
+
+
+@app.get("/sync/config", response_model=DocDBConfigResponse)
+def sync_config() -> DocDBConfigResponse:
+    """What's available for syncing — the UI uses this to decide whether
+    to show the sync section and to prefill the filter preview."""
+    return DocDBConfigResponse(
+        configured=settings.docdb_configured,
+        database=settings.docdb_database,
+        collection=settings.docdb_collection,
+        default_filter=settings.docdb_default_filter,
+        period_field=settings.docdb_period_field,
+        reporting_period=settings.docdb_reporting_period,
+        reporting_period_field=settings.docdb_reporting_period_field if settings.docdb_reporting_period else None,
+    )
+
+
+def _run_sync_bg(sync_id: str, filter_doc: dict, period: str) -> None:
+    """BackgroundTask wrapper. Swallows SyncError because run_sync has
+    already written the failure to the ingestions table."""
+    source = DocumentDBSource(
+        uri=settings.docdb_uri,
+        database=settings.docdb_database,
+        collection=settings.docdb_collection,
+    )
+    try:
+        run_sync(
+            sync_id=sync_id,
+            source=source,
+            filter_doc=filter_doc,
+            period=period,
+            db_path=settings.duckdb_path,
+        )
+    except SyncError:
+        pass
+
+
+@app.post("/sync", response_model=SyncResponse)
+def sync_from_docdb(req: SyncRequest, background_tasks: BackgroundTasks) -> SyncResponse:
+    if not settings.docdb_configured:
+        raise HTTPException(
+            400,
+            "DocumentDB sync is not configured. Set DOCDB_URI, DOCDB_DATABASE, "
+            "DOCDB_COLLECTION, and DOCDB_PERIOD_FIELD in your .env to enable.",
+        )
+    if not req.period.strip():
+        raise HTTPException(400, "period is required, e.g. 'FY 2024-25'.")
+
+    filter_doc = build_filter(
+        default_filter=settings.docdb_default_filter,
+        period=req.period,
+        period_field=settings.docdb_period_field,
+        reporting_period=settings.docdb_reporting_period,
+        reporting_period_field=settings.docdb_reporting_period_field,
+        overrides=req.filter_override,
+    )
+
+    sync_id = str(uuid.uuid4())
+    source_metadata = {
+        "source_type": "docdb",
+        "database": settings.docdb_database,
+        "collection": settings.docdb_collection,
+        "filter": filter_doc,
+    }
+    with rw_connection(settings.duckdb_path) as conn:
+        conn.execute(
+            "INSERT INTO ingestions (id, filename, period, status, source_type, source_metadata) "
+            "VALUES (?, ?, ?, 'pending', 'docdb', ?)",
+            [sync_id, f"<docdb:{settings.docdb_collection}>", req.period, json.dumps(source_metadata)],
+        )
+
+    background_tasks.add_task(_run_sync_bg, sync_id, filter_doc, req.period)
+
+    return SyncResponse(sync_id=sync_id, status="pending", filter_applied=filter_doc)
+
+
+@app.get("/sync/{sync_id}", response_model=IngestionStatus)
+def get_sync_status(sync_id: str) -> IngestionStatus:
+    """Alias for /uploads/{id} — same data, different conceptual surface."""
+    return get_upload(sync_id)
 
 
 @app.get("/health")
