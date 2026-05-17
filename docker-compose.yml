@@ -1,0 +1,67 @@
+# Two services from one image: api (FastAPI) and ui (Streamlit).
+# The ui talks to the api over Docker's internal network so the customer
+# only ever needs to interact with port 8501 (the browser-facing UI).
+#
+# Quick start:
+#   cp .env.example .env
+#   $EDITOR .env                   # paste ANTHROPIC_API_KEY (+ DOCDB_* if syncing)
+#   docker compose up -d
+#   open http://localhost:8501
+#
+# Data persistence:
+#   The ./data directory on the host is bind-mounted into both containers.
+#   DuckDB file (data/ctb.duckdb) and uploaded Excels (data/uploads/) live
+#   there. Nothing about the trial balance ever leaves this directory.
+
+services:
+  api:
+    build: .
+    image: ctb-copilot:latest
+    container_name: ctb-copilot-api
+    restart: unless-stopped
+    # Bind to 127.0.0.1 so the API isn't exposed to other hosts by default.
+    # Change to "8000:8000" if you need remote access.
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+    environment:
+      # Override the .env defaults so paths are absolute inside the container.
+      API_HOST: "0.0.0.0"
+      API_PORT: "8000"
+      DUCKDB_PATH: /app/data/ctb.duckdb
+      STORAGE_DIR: /app/data/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
+  ui:
+    image: ctb-copilot:latest
+    container_name: ctb-copilot-ui
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8501:8501"
+    env_file:
+      - .env
+    environment:
+      # The UI reaches the API via Docker's built-in DNS (service name → container).
+      API_BASE_URL: http://api:8000
+    command:
+      - uv
+      - run
+      - --no-dev
+      - streamlit
+      - run
+      - src/ctb_copilot/ui.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+      - --server.headless=true
+      - --browser.gatherUsageStats=false

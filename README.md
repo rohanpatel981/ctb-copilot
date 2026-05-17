@@ -4,7 +4,7 @@
 
 Built for chartered accountants and finance teams running consolidation across multiple entities, currencies, and financial years. Every answer carries its receipts so the analyst can paste it straight into working papers and the engagement manager can sign off without re-running it from scratch.
 
-> Public preview, v0.3 — ships the DocumentDB sync path so customers with their TB already in AWS DocumentDB (or any Mongo-compatible store) can skip the Excel-upload step. Ingestion guards (header validation, per-row reconciliation), audit trail, Excel export, eval harness, atomic-swap sync, and a 43-test suite all in. Docker / S3 / auth are the next milestone (v1.0).
+> Public preview, v0.4 — one-command Docker deployment. `docker compose up -d` and you're running, no Python toolchain required on the host. Combined with v0.3's DocumentDB sync, v0.2's eval harness + Excel export + ingestion guards, and the 43-test suite, this is the first version a CA firm IT admin can deploy in 5 minutes. S3 storage and auth land in v1.0.
 
 ## What it does, in one example
 
@@ -32,24 +32,40 @@ Assistant ▸  ₹ (37.84) Cr   (negative per trial-balance convention)
 
 ## How a CA firm uses it
 
-### 1. One-time setup (~10 minutes, IT admin)
+### 1. One-time setup (~5 minutes, IT admin)
+
+You need Docker — [Docker Desktop](https://www.docker.com/products/docker-desktop/) on Mac/Windows, [Docker Engine](https://docs.docker.com/engine/install/) on Linux.
 
 ```sh
 git clone https://github.com/rohanpatel981/ctb-copilot
 cd ctb-copilot
-uv sync                     # installs Python deps via uv
 cp .env.example .env
-$EDITOR .env                # paste ANTHROPIC_API_KEY
+$EDITOR .env                # paste ANTHROPIC_API_KEY (and DOCDB_* if you want sync)
+docker compose up -d        # builds the image, starts both services
 ```
 
-Then in two terminals:
+That's it. Open <http://localhost:8501>.
+
+What you get:
+
+- `ctb-copilot-api` on `127.0.0.1:8000` — FastAPI backend
+- `ctb-copilot-ui` on `127.0.0.1:8501` — Streamlit UI
+- Both bind to `127.0.0.1` by default (not exposed externally). Change to `0.0.0.0:8000`/`8501` in `docker-compose.yml` for remote access.
+- Your data lives in `./data/` on the host machine — bind-mounted into both containers. Never leaves your disk.
+
+To stop: `docker compose down`. To upgrade: `git pull && docker compose up -d --build`.
+
+<details>
+<summary>Alternative: run without Docker (for development)</summary>
 
 ```sh
-uv run ctb-api              # API on http://localhost:8000
-uv run ctb-ui               # UI opens at http://localhost:8501
+uv sync
+cp .env.example .env
+$EDITOR .env
+uv run ctb-api              # in terminal 1
+uv run ctb-ui               # in terminal 2
 ```
-
-> Docker image + one-command deployment is on the v1.0 roadmap. For now, the project runs as two local processes (FastAPI backend + Streamlit UI).
+</details>
 
 ### 2. Analyst day-to-day
 
@@ -269,20 +285,25 @@ The runner prints a pass/fail table per case + per check, and exits non-zero if 
 - Filter builder that composes static config + selected period + per-sync overrides; supports full Mongo operators
 - 20 new tests covering filter merging, doc projection, batched streaming, atomic swap, rollback, reconciliation rejection mid-sync
 
-**v0.4 — next:**
+**v0.4 — shipped:**
+- One-command Docker deployment (`docker compose up -d`) — no Python on host required
+- Two services (api + ui) from one image; healthcheck wires the dependency order
+- Bind-mounted `./data` volume keeps DuckDB + uploads on host disk
+- README now leads with the Docker quick-start; `uv` path stays as the dev alternative
+
+**v0.5 — next:**
 - Field-mapping config for the next customer whose source schema differs from the canonical 22-column shape
 - Streaming responses in the chat UI
 - "Flag wrong" feedback loop → review queue
 - Expand golden Q&As to ~30 cases (multi-FY, ratios, edge cases)
 - Confidence-scoring improvements (hybrid: model self-report + deterministic signals)
 
-**v1.0 — deployable to clients:**
-- Docker image + `docker-compose.yml` + one-command setup
+**v1.0 — multi-tenant, secured, deployable at scale:**
 - S3-compatible storage adapter (S3 / R2 / MinIO)
-- API-key auth
-- SSO via OIDC (Microsoft 365, Google Workspace)
+- API-key auth (then SSO via OIDC — Microsoft 365, Google Workspace)
 - Engagement workspaces (multi-tenant per-deployment)
 - Additional `DatabaseSource` adapters: Postgres, MySQL, SQL Server
+- Published image on a registry (so customers don't need to clone + build)
 
 **Beyond:**
 - LLM-assisted column mapping for variant CTB formats
