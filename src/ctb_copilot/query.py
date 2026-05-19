@@ -178,30 +178,42 @@ def _compute_ratio(rows: list[dict], columns: list[str]) -> list[dict]:
     return ratios
 
 
-def _list_fin_year_periods(scope: TenantScope, db_path: Path) -> list[str]:
-    """Fetch the distinct `fin_year_period` labels currently stored for the
-    tenant's data. Passed into the prompt so the LLM picks from real values
-    instead of guessing/normalising what the user typed."""
+def _distinct_values(scope: TenantScope, db_path: Path, column: str) -> list[str]:
+    """Distinct, non-null values of `column` in ctb_data for the tenant scope.
+    Used to inject real categorical values into the LLM prompt so it picks
+    from what's actually there instead of guessing canonical strings."""
     pairs = scope.as_filter_pairs()
     if not pairs:
         return []
-    where = " AND ".join(f"{col}=?" for col, _ in pairs)
+    where = " AND ".join(f"{c}=?" for c, _ in pairs)
     values = [v for _, v in pairs]
     with ro_connection(db_path) as conn:
         rows = conn.execute(
-            f"SELECT DISTINCT fin_year_period FROM ctb_data WHERE {where} "
-            "AND fin_year_period IS NOT NULL ORDER BY fin_year_period",
+            f"SELECT DISTINCT {column} FROM ctb_data WHERE {where} "
+            f"AND {column} IS NOT NULL ORDER BY {column}",
             values,
         ).fetchall()
     return [r[0] for r in rows if r[0]]
 
 
+def _list_fin_year_periods(scope: TenantScope, db_path: Path) -> list[str]:
+    """Distinct `fin_year_period` labels in the tenant's data."""
+    return _distinct_values(scope, db_path, "fin_year_period")
+
+
+def _list_fs_categories(scope: TenantScope, db_path: Path) -> list[str]:
+    """Distinct `fs_category` labels in the tenant's data."""
+    return _distinct_values(scope, db_path, "fs_category")
+
+
 async def run_query(*, question: str, scope: TenantScope, llm: LLMProvider, db_path: Path) -> QueryResult:
     available_periods = _list_fin_year_periods(scope, db_path)
+    available_fs_categories = _list_fs_categories(scope, db_path)
     plan: SQLPlan = await llm.generate_sql_plan(
         schema_ddl=LLM_SCHEMA_DDL,
         question=question,
         available_fin_year_periods=available_periods,
+        available_fs_categories=available_fs_categories,
     )
     validate_safe_select(plan.sql)
 

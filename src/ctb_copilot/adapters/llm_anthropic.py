@@ -36,7 +36,7 @@ For aggregates, include `fin_year_period` in the SELECT so the analyst sees whic
 
 - `fin_year_period`: **human-readable FY label** (e.g. 'FY 2024-25', 'FY 2025-26 Q1'). User-supplied at sync/upload time. **Use this for time filtering** — single-period AND cross-period queries. There is NO date column.
 - `fin_year_id`, `reporting_period_id`: **UUIDs** of a single specific (year, period). The server pins these via the tenant scope when relevant. Do NOT filter on them yourself.
-- `fs_category`: known values are 'Assets', 'Liabilities', 'Equity', 'Revenue', 'Expense', 'Other Comprehensive', 'Tax expense'. Case-sensitive — use exact strings. 'Tax expense' and 'Other Comprehensive' are P&L-side categories that sit alongside 'Revenue' and 'Expense'; do not exclude them silently.
+- `fs_category`: financial-statement category. Use only values from the list below (different deployments use different spellings — e.g. 'Expense' vs 'Expenses', singular vs plural).{fs_categories_block}
 - `gl_nature`: 'Balance Sheet' or 'Statement of PL'. Useful to separate BS from P&L.
 - `bs_classification`: e.g. 'Current liabilities', 'Non-current assets'.
 - `fsli`: Financial statement line item, e.g. 'Trade and other payables'.
@@ -182,6 +182,7 @@ confidence: medium
 def _build_system(
     schema_ddl: str,
     available_fin_year_periods: list[str] | tuple[str, ...] = (),
+    available_fs_categories: list[str] | tuple[str, ...] = (),
 ) -> str:
     if available_fin_year_periods:
         periods_repr = ", ".join(repr(p) for p in sorted(available_fin_year_periods))
@@ -196,7 +197,24 @@ def _build_system(
             "so any year filter the user asks for will return 0 rows. Skip the "
             "filter and call this out in the explanation.)"
         )
-    return _SYSTEM_TEMPLATE.format(schema_ddl=schema_ddl, periods_block=periods_block)
+
+    if available_fs_categories:
+        cats_repr = ", ".join(repr(c) for c in sorted(available_fs_categories))
+        fs_categories_block = (
+            f"\n\n**Available `fs_category` values in this tenant's data** "
+            f"(the ONLY legal strings — different deployments use 'Expense' vs "
+            f"'Expenses', 'Other Comprehensive' vs 'Other Comprehensive Income', "
+            f"etc., so always pick from this list, never from the canonical "
+            f"hardcoded names): [{cats_repr}]."
+        )
+    else:
+        fs_categories_block = ""
+
+    return _SYSTEM_TEMPLATE.format(
+        schema_ddl=schema_ddl,
+        periods_block=periods_block,
+        fs_categories_block=fs_categories_block,
+    )
 
 
 class AnthropicLLM:
@@ -213,8 +231,13 @@ class AnthropicLLM:
         sample_rows: str = "",
         question: str,
         available_fin_year_periods: list[str] | tuple[str, ...] = (),
+        available_fs_categories: list[str] | tuple[str, ...] = (),
     ) -> SQLPlan:
-        system_text = _build_system(schema_ddl, available_fin_year_periods)
+        system_text = _build_system(
+            schema_ddl,
+            available_fin_year_periods,
+            available_fs_categories,
+        )
         response = await self.client.messages.parse(
             model=self.model,
             max_tokens=4096,

@@ -42,4 +42,5 @@ class LLMProvider(Protocol):
         sample_rows: str,
         question: str,
         available_fin_year_periods: list[str] | tuple[str, ...] = (),
+        available_fs_categories: list[str] | tuple[str, ...] = (),
     ) -> SQLPlan: ...
