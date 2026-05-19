@@ -178,30 +178,61 @@ def _compute_ratio(rows: list[dict], columns: list[str]) -> list[dict]:
     return ratios
 
 
-def _list_fin_year_periods(scope: TenantScope, db_path: Path) -> list[str]:
-    """Fetch the distinct `fin_year_period` labels currently stored for the
-    tenant's data. Passed into the prompt so the LLM picks from real values
-    instead of guessing/normalising what the user typed."""
+# Categorical/string columns whose distinct values get injected into the
+# system prompt so the LLM filters on what's actually in the data instead
+# of guessing canonical strings. Numeric/UUID/ID columns are excluded.
+# Order here is the order they appear in the prompt's vocabulary block.
+_VOCAB_COLUMNS: tuple[str, ...] = (
+    "fin_year_period",
+    "gl_nature",
+    "fs_category",
+    "bs_classification",
+    "fsli",
+    "grouping",
+    "sub_grouping",
+    "entity_name",
+    "entity_code",
+    "functional_currency",
+)
+
+# Cap on distinct values per column; above this, the column is skipped to
+# keep the prompt from ballooning. Columns like consol_gl_code can have
+# hundreds of distinct values and aren't useful to enumerate anyway.
+_VOCAB_MAX_VALUES_PER_COLUMN = 50
+
+
+def _collect_available_values(
+    scope: TenantScope, db_path: Path
+) -> dict[str, list[str]]:
+    """Return {column: [distinct values]} for the tenant scope, restricted
+    to low-cardinality categorical columns. The LLM uses this as the live
+    vocabulary for any string filter it generates."""
     pairs = scope.as_filter_pairs()
     if not pairs:
-        return []
+        return {}
     where = " AND ".join(f"{col}=?" for col, _ in pairs)
-    values = [v for _, v in pairs]
+    bound = [v for _, v in pairs]
+    out: dict[str, list[str]] = {}
     with ro_connection(db_path) as conn:
-        rows = conn.execute(
-            f"SELECT DISTINCT fin_year_period FROM ctb_data WHERE {where} "
-            "AND fin_year_period IS NOT NULL ORDER BY fin_year_period",
-            values,
-        ).fetchall()
-    return [r[0] for r in rows if r[0]]
+        for col in _VOCAB_COLUMNS:
+            rows = conn.execute(
+                f"SELECT DISTINCT {col} FROM ctb_data WHERE {where} "
+                f"AND {col} IS NOT NULL ORDER BY {col} "
+                f"LIMIT {_VOCAB_MAX_VALUES_PER_COLUMN + 1}",
+                bound,
+            ).fetchall()
+            vals = [r[0] for r in rows if r[0]]
+            if 0 < len(vals) <= _VOCAB_MAX_VALUES_PER_COLUMN:
+                out[col] = vals
+    return out
 
 
 async def run_query(*, question: str, scope: TenantScope, llm: LLMProvider, db_path: Path) -> QueryResult:
-    available_periods = _list_fin_year_periods(scope, db_path)
+    available_values = _collect_available_values(scope, db_path)
     plan: SQLPlan = await llm.generate_sql_plan(
         schema_ddl=LLM_SCHEMA_DDL,
         question=question,
-        available_fin_year_periods=available_periods,
+        available_values=available_values,
     )
     validate_safe_select(plan.sql)
 

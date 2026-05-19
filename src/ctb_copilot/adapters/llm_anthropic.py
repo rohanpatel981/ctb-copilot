@@ -21,27 +21,24 @@ _SYSTEM_TEMPLATE = """You are a SQL query assistant for a consolidated trial bal
 
 The table has 6 tenant-identity columns: `client_id`, `gaap_id`, `reporting_parent_company_id`, `fin_year_id`, `reporting_period_id`, `currency_id`. **The server automatically adds WHERE clauses for the active tenant scope** (4 of these 6, always; the other 2 sometimes). You do NOT need to filter on them — your SQL will be rewritten to include the tenant filters before execution.
 
-When filtering by financial year, ALWAYS use the `fin_year_period` column (a human-readable label supplied by the user at sync/upload time). Do NOT filter on `fin_year_id` or `reporting_period_id` — those are UUIDs that pin a single (year, period) combo and break cross-year queries.
-
-**`fin_year_period` values are NOT standardised.** Different syncs may carry labels like `'FY 26-27'`, `'FY 2026-27'`, `'FY26-27'`, etc., depending on what the user typed in the engagement form. {periods_block}
-
-- Single-year question → `WHERE fin_year_period = '<exact value from the list>'`
-- Cross-year comparison → `WHERE fin_year_period IN ('<value 1>', '<value 2>')` and GROUP BY `fin_year_period`
-- If the user doesn't name a year, omit the filter entirely — the server's tenant scope handles it
-- If no value in the list plausibly matches the user's reference, omit the filter and say so in the explanation; **do NOT invent labels.**
+When filtering by financial year, ALWAYS use the `fin_year_period` column (a human-readable label supplied by the user at sync/upload time). Do NOT filter on `fin_year_id` or `reporting_period_id` — those are UUIDs that pin a single (year, period) combo and break cross-year queries. Pick the year-label value from the live vocabulary section below.
 
 For aggregates, include `fin_year_period` in the SELECT so the analyst sees which year the answer covers.
+
+{vocabulary_block}
+
+**Rule for every string-column filter** (fs_category, bs_classification, fsli, grouping, sub_grouping, gl_nature, entity_name, entity_code, functional_currency, fin_year_period): pick the value from the vocabulary above. Different deployments use different spellings (singular vs plural, abbreviated vs full, varying whitespace), so the canonical names you might assume are often wrong. If no value plausibly matches the user's reference, omit the filter, call it out in `explanation`, and **never invent values** — that silently returns 0 rows.
 
 # Column meanings
 
 - `fin_year_period`: **human-readable FY label** (e.g. 'FY 2024-25', 'FY 2025-26 Q1'). User-supplied at sync/upload time. **Use this for time filtering** — single-period AND cross-period queries. There is NO date column.
 - `fin_year_id`, `reporting_period_id`: **UUIDs** of a single specific (year, period). The server pins these via the tenant scope when relevant. Do NOT filter on them yourself.
-- `fs_category`: known values are 'Assets', 'Liabilities', 'Equity', 'Revenue', 'Expense', 'Other Comprehensive', 'Tax expense'. Case-sensitive — use exact strings. 'Tax expense' and 'Other Comprehensive' are P&L-side categories that sit alongside 'Revenue' and 'Expense'; do not exclude them silently.
-- `gl_nature`: 'Balance Sheet' or 'Statement of PL'. Useful to separate BS from P&L.
-- `bs_classification`: e.g. 'Current liabilities', 'Non-current assets'.
-- `fsli`: Financial statement line item, e.g. 'Trade and other payables'.
-- `entity_name` / `entity_code`: every row is tagged to one entity. Multiple entities per period are typical (this is a consolidated TB).
-- `functional_currency`: the entity's reporting currency. Known values include 'INR', 'USD', 'SGD' (others possible).
+- `fs_category`: financial-statement category. Use only values from the live vocabulary above.
+- `gl_nature`: BS vs P&L marker. Use only values from the live vocabulary above.
+- `bs_classification`: balance-sheet sub-classification (e.g. current vs non-current). Live vocab only.
+- `fsli`: Financial statement line item (e.g. 'Trade and other payables'). Live vocab only.
+- `entity_name` / `entity_code`: every row is tagged to one entity. Live vocab only.
+- `functional_currency`: the entity's reporting currency. Live vocab only.
 - `amount_functional_ccy`: row value in the entity's own books.
 - `amount_reporting_ccy`: row value after FX translation to the group's reporting currency, BEFORE consolidation adjustments.
 - `amount_consolidated`: final consolidated figure after all adjustments. **THIS IS WHAT USERS USUALLY MEAN.**
@@ -93,7 +90,7 @@ Use `amount_reporting_ccy` if and only if:
 
 # How to handle common question shapes
 
-1. **Period filtering**: use `fin_year_period` with values picked from the "Available fin_year_period values" list above (exact `=` or `IN (...)`). Never use `fin_year_id` or `reporting_period_id`. Never invent labels not in the list.
+1. **Period filtering**: use `fin_year_period` with values picked from the vocabulary block above (exact `=` or `IN (...)`). Never use `fin_year_id` or `reporting_period_id`. Never invent labels.
 2. **Entity filtering**: use `entity_code` or `entity_name`. State which entities you included in the explanation.
 3. **High-level totals**: `SUM(amount_consolidated)` grouped by `fs_category` or `bs_classification`.
 4. **Year-over-year (YoY)**: `SELECT fin_year_period, SUM(amount_consolidated) FROM ctb_data WHERE fs_category = 'X' GROUP BY fin_year_period ORDER BY fin_year_period`. Then set `post_process` = "yoy_pct".
@@ -181,22 +178,38 @@ confidence: medium
 
 def _build_system(
     schema_ddl: str,
-    available_fin_year_periods: list[str] | tuple[str, ...] = (),
+    available_values: dict[str, list[str]] | None = None,
 ) -> str:
-    if available_fin_year_periods:
-        periods_repr = ", ".join(repr(p) for p in sorted(available_fin_year_periods))
-        periods_block = (
-            "\n\n**Available `fin_year_period` values in this tenant's data** "
-            f"(the only legal strings — match the user's intent to one of these): "
-            f"[{periods_repr}]."
+    """Build the system prompt with a live "vocabulary" section listing the
+    distinct categorical values currently in ctb_data for the tenant scope.
+    The LLM uses this as the authoritative source for any string filter."""
+    if not available_values:
+        vocabulary_block = (
+            "# Live data vocabulary\n\n"
+            "(No data has been synced for this tenant yet — any string filter\n"
+            "the user asks for will return 0 rows. Skip the filters and call\n"
+            "this out in the explanation.)"
         )
     else:
-        periods_block = (
-            "\n\n(No `fin_year_period` data has been synced for this tenant yet, "
-            "so any year filter the user asks for will return 0 rows. Skip the "
-            "filter and call this out in the explanation.)"
+        lines = ["# Live data vocabulary\n"]
+        lines.append(
+            "These are the distinct values currently in ctb_data for this tenant."
         )
-    return _SYSTEM_TEMPLATE.format(schema_ddl=schema_ddl, periods_block=periods_block)
+        lines.append(
+            "**Pick string-filter values from this list, never invent.** Match the "
+            "user's intent (which may use a different spelling) to one of these."
+        )
+        lines.append("")
+        for col, vals in available_values.items():
+            sorted_vals = sorted(vals)
+            repr_str = ", ".join(repr(v) for v in sorted_vals)
+            lines.append(f"- `{col}`: [{repr_str}]")
+        vocabulary_block = "\n".join(lines)
+
+    return _SYSTEM_TEMPLATE.format(
+        schema_ddl=schema_ddl,
+        vocabulary_block=vocabulary_block,
+    )
 
 
 class AnthropicLLM:
@@ -212,9 +225,9 @@ class AnthropicLLM:
         schema_ddl: str,
         sample_rows: str = "",
         question: str,
-        available_fin_year_periods: list[str] | tuple[str, ...] = (),
+        available_values: dict[str, list[str]] | None = None,
     ) -> SQLPlan:
-        system_text = _build_system(schema_ddl, available_fin_year_periods)
+        system_text = _build_system(schema_ddl, available_values)
         response = await self.client.messages.parse(
             model=self.model,
             max_tokens=4096,
