@@ -15,8 +15,12 @@
 
 services:
   api:
-    build: .
-    image: ctb-copilot:latest
+    # Pull from GitHub Container Registry by default. Falls back to a
+    # local build if the image isn't reachable (e.g. you're hacking on
+    # the source) — `docker compose build` rebuilds with this Dockerfile.
+    image: ghcr.io/rohanpatel981/ctb-copilot:latest
+    build:
+      context: .
     container_name: ctb-copilot-api
     restart: unless-stopped
     # Bind to 127.0.0.1 so the API isn't exposed to other hosts by default.
@@ -41,7 +45,7 @@ services:
       start_period: 15s
 
   ui:
-    image: ctb-copilot:latest
+    image: ghcr.io/rohanpatel981/ctb-copilot:latest
     container_name: ctb-copilot-ui
     restart: unless-stopped
     depends_on:

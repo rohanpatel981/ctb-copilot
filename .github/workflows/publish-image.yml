@@ -1,0 +1,67 @@
+name: Publish Docker image to GHCR
+
+# Builds ctb-copilot's Docker image and pushes to GitHub Container Registry
+# (ghcr.io/rohanpatel981/ctb-copilot). Customers `docker compose pull` from
+# there instead of cloning + building locally.
+#
+# Triggers:
+#   - push to main           → ghcr.io/.../ctb-copilot:latest + :main + :sha-<short>
+#   - push of v* tag         → :v1.2.3 + :1.2 + :latest + :sha-<short>
+#   - manual run             → workflow_dispatch from the Actions UI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=ctb-copilot
+            org.opencontainers.image.description=Multi-tenant Q&A copilot over consolidated trial balance data for CA firms
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache makes incremental builds ~30s instead of 3-4 min.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

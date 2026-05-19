@@ -43,12 +43,29 @@ Assistant ▸  ₹ (37.84) Cr   (negative per trial-balance convention)
 You need Docker — [Docker Desktop](https://www.docker.com/products/docker-desktop/) on Mac/Windows, [Docker Engine](https://docs.docker.com/engine/install/) on Linux.
 
 ```sh
+# Grab just the compose file + env template — no clone needed
+curl -fsSL -O https://raw.githubusercontent.com/rohanpatel981/ctb-copilot/main/docker-compose.yml
+curl -fsSL -O https://raw.githubusercontent.com/rohanpatel981/ctb-copilot/main/.env.example
+mv .env.example .env
+$EDITOR .env                # paste ANTHROPIC_API_KEY (+ DOCDB_* + API_TOKEN)
+docker compose up -d        # pulls the prebuilt image from GHCR, ~30s
+```
+
+The image is hosted at `ghcr.io/rohanpatel981/ctb-copilot:latest` (public; no auth needed to pull). For a specific version, pin to a tag like `:v0.5.0` by editing `docker-compose.yml` before bringing up the stack.
+
+To upgrade later: `docker compose pull && docker compose up -d`.
+
+<details>
+<summary>Alternative: clone + build locally (for development)</summary>
+
+```sh
 git clone https://github.com/rohanpatel981/ctb-copilot
 cd ctb-copilot
 cp .env.example .env
-$EDITOR .env                # paste ANTHROPIC_API_KEY (+ DOCDB_* + API_TOKEN)
-docker compose up -d        # builds the image, starts both services
+$EDITOR .env
+docker compose up -d --build    # builds from source instead of pulling
 ```
+</details>
 
 Required `.env` values for a multi-tenant deployment:
 
