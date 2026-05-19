@@ -152,10 +152,38 @@ def _project_console_append_tb(doc: dict[str, Any]) -> dict[str, Any]:
         fctrAmount                    → each {value, …}
       - totalBalance                  → running consolidated total
 
-    AppendTB is the row-level pivot: every adjustment module ($inc-s) into
-    one of the *Amount fields, and totalBalance is kept in sync as
-        totalBalance == amountInLocalCurrency.value + Σ(all adj_*).
-    So the canonical reconciliation invariant holds by construction.
+    AppendTB is the row-level pivot: every adjustment module $inc-s into
+    one of the *Amount fields. Currency semantics are the critical bit:
+
+      - `amountInLocalCurrency`     → entity's own books, currency VARIES
+                                      per entity (INR for an Indian sub,
+                                      USD for a US sub, …). Cannot be
+                                      summed across entities. Maps to
+                                      ctb-copilot's `amount_functional_ccy`
+                                      (the entity-functional view).
+
+      - `amountInFunctionalCurrency`→ post-FX, in the group's reporting
+                                      currency. All rows in same currency,
+                                      so this is the one you sum to get
+                                      consolidated totals. Maps to
+                                      ctb-copilot's `amount_reporting_ccy`.
+
+      - All `*Amount` adjustment fields are also in the group's reporting
+        currency, alongside `amountInFunctionalCurrency`.
+
+      - `totalBalance` is supposed to equal
+            amountInFunctionalCurrency.value + Σ(adjustments)
+        but the platform appears to populate it only on adjustment-POST
+        cycles — a fresh "appended, not yet adjusted" scope has
+        totalBalance=0 across the board. So we compute amount_consolidated
+        from the components instead of trusting totalBalance; the two
+        agree once the platform has fully posted.
+
+    Naming clash to beware: Mongo "Functional" = group's functional/
+    reporting currency (consistent across rows). ctb-copilot's
+    `amount_functional_ccy` historically means the ENTITY's own books
+    (varies per entity). So the two "functional"s are *opposite*; we
+    map by SEMANTICS, not name.
     """
 
     def _val(field: str) -> float | None:
@@ -164,7 +192,19 @@ def _project_console_append_tb(doc: dict[str, Any]) -> dict[str, Any]:
             return sub.get("value")
         return None
 
-    func = doc.get("amountInFunctionalCurrency") or {}
+    local = doc.get("amountInLocalCurrency") or {}
+    adjustments = [
+        _val("otherAdjustmentAmount"),
+        _val("nciAmount"),
+        _val("goodWillAmount"),
+        _val("ppaAmount"),
+        _val("iceAmount"),
+        _val("iceShareCapitalAmount"),
+        _val("retainedEarningsAmount"),
+        _val("fctrAmount"),
+    ]
+    reporting = _val("amountInFunctionalCurrency")
+    consolidated = (reporting or 0.0) + sum((a or 0.0) for a in adjustments)
     return {
         "consol_gl_code": doc.get("consoleGlCode"),
         "consol_gl_description": doc.get("consoleGlDesc"),
@@ -176,18 +216,20 @@ def _project_console_append_tb(doc: dict[str, Any]) -> dict[str, Any]:
         "fsli": doc.get("fsli"),
         "grouping": doc.get("groupings"),
         "sub_grouping": doc.get("subGroupings"),
-        "functional_currency": func.get("currency") if isinstance(func, dict) else None,
-        "amount_functional_ccy": func.get("value") if isinstance(func, dict) else None,
-        "amount_reporting_ccy": _val("amountInLocalCurrency"),
-        "adj_other_consolidated": _val("otherAdjustmentAmount"),
-        "adj_nci": _val("nciAmount"),
-        "adj_goodwill": _val("goodWillAmount"),
-        "adj_ppa": _val("ppaAmount"),
-        "adj_intercompany": _val("iceAmount"),
-        "adj_investment_capital": _val("iceShareCapitalAmount"),
-        "adj_retained_earnings": _val("retainedEarningsAmount"),
-        "adj_fctr": _val("fctrAmount"),
-        "amount_consolidated": doc.get("totalBalance"),
+        # Entity's own books — currency varies per entity.
+        "functional_currency": local.get("currency") if isinstance(local, dict) else None,
+        "amount_functional_ccy": _val("amountInLocalCurrency"),
+        # Group reporting currency — all rows aligned. Safe to sum.
+        "amount_reporting_ccy": reporting,
+        "adj_other_consolidated": adjustments[0],
+        "adj_nci": adjustments[1],
+        "adj_goodwill": adjustments[2],
+        "adj_ppa": adjustments[3],
+        "adj_intercompany": adjustments[4],
+        "adj_investment_capital": adjustments[5],
+        "adj_retained_earnings": adjustments[6],
+        "adj_fctr": adjustments[7],
+        "amount_consolidated": consolidated,
     }
 
 
