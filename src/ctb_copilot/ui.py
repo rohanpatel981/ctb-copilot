@@ -129,6 +129,38 @@ def _confidence_badge(conf: str) -> str:
     return {"high": "🟢 High", "medium": "🟡 Medium", "low": "🔴 Low"}.get(conf, conf)
 
 
+# Map URL query-param names a parent FE may send → engagement-form session
+# keys. Both short ("parentId") and long ("reportingParentCompanyId") forms
+# are accepted so the FE side is free to pick either.
+_URL_PARAM_TO_SESSION_KEY: dict[str, str] = {
+    "clientId": "eng-clientId",
+    "gaapId": "eng-gaapId",
+    "parentId": "eng-reportingParentCompanyId",
+    "reportingParentCompanyId": "eng-reportingParentCompanyId",
+    "finYearId": "eng-finYearId",
+    "periodId": "eng-reportingPeriodId",
+    "reportingPeriodId": "eng-reportingPeriodId",
+    "currencyId": "eng-currencyId",
+}
+
+
+def _prefill_engagement_from_query_params() -> None:
+    """If the page was opened with ?clientId=...&gaapId=...&parentId=...
+    &finYearId=...&periodId=...&currencyId=..., write those into the
+    engagement-form session state so the user lands pre-scoped.
+
+    Runs at most once per session — subsequent reruns are skipped so the
+    user's manual edits in the engagement form are not clobbered.
+    """
+    if st.session_state.get("_engagement_prefilled"):
+        return
+    for url_key, session_key in _URL_PARAM_TO_SESSION_KEY.items():
+        value = st.query_params.get(url_key)
+        if value:
+            st.session_state[session_key] = value
+    st.session_state["_engagement_prefilled"] = True
+
+
 # ---------- engagement form ----------
 
 
@@ -414,6 +446,7 @@ def main() -> None:
     st.set_page_config(page_title="ctb-copilot", layout="wide", page_icon="📊")
     st.title("ctb-copilot")
     st.caption("Multi-tenant Q&A over consolidated trial balance data. Every answer shows its SQL and source rows.")
+    _prefill_engagement_from_query_params()
     render_engagement_form()
     render_docdb_sync()
     render_sidebar()
