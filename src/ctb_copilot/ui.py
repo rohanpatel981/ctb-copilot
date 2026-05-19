@@ -356,6 +356,90 @@ def render_upload() -> None:
 # ---------- chat ----------
 
 
+def _humanize_col(col: str) -> str:
+    """Turn `consol_gl_description` into 'Consol GL Description'."""
+    overrides = {
+        "fin_year_period": "Period",
+        "amount_consolidated": "Consolidated",
+        "amount_reporting_ccy": "Reporting amount",
+        "amount_functional_ccy": "Functional amount",
+        "adj_other_consolidated": "Other adjustment",
+        "adj_nci": "NCI",
+        "adj_goodwill": "Goodwill",
+        "adj_ppa": "PPA",
+        "adj_intercompany": "Intercompany",
+        "adj_investment_capital": "Investment / share-capital",
+        "adj_retained_earnings": "Retained earnings",
+        "adj_fctr": "FCTR",
+        "fs_category": "FS category",
+        "bs_classification": "BS classification",
+        "fsli": "FSLI",
+        "consol_gl_code": "GL code",
+        "consol_gl_description": "GL description",
+        "entity_name": "Entity",
+        "entity_code": "Entity code",
+        "gl_nature": "GL nature",
+        "functional_currency": "Currency",
+    }
+    return overrides.get(col, col.replace("_", " ").capitalize())
+
+
+# Internal columns we never want to show in the answer surface — they're
+# scope/audit data, not part of the answer. They stay visible in the
+# "Source rows" expander so a CA can audit if needed.
+_HIDDEN_COLUMNS = frozenset({
+    "client_id", "gaap_id", "reporting_parent_company_id",
+    "fin_year_id", "reporting_period_id", "currency_id",
+    "upload_id", "row_number",
+})
+
+
+def _visible_keys(row: dict) -> list[str]:
+    return [k for k in row.keys() if k not in _HIDDEN_COLUMNS]
+
+
+def _render_single_row(row: dict) -> None:
+    """Pretty render for a 1-row answer: a row of metric cards.
+
+    Each numeric column gets a big-number card; each text/category column
+    appears as a small chip above the numbers. NULLs render as an em-dash
+    so the analyst sees the column was selected but had no data.
+    """
+    keys = _visible_keys(row)
+    text_keys = [k for k in keys if not isinstance(row.get(k), (int, float))]
+    num_keys = [k for k in keys if isinstance(row.get(k), (int, float))]
+
+    if text_keys:
+        chips = "".join(
+            f"<span class='ctb-chip'>{_humanize_col(k)} · {row.get(k)}</span>"
+            for k in text_keys
+            if row.get(k) is not None
+        )
+        if chips:
+            st.markdown(f"<div class='ctb-chips'>{chips}</div>", unsafe_allow_html=True)
+
+    if num_keys:
+        cols = st.columns(min(len(num_keys), 4))
+        for i, k in enumerate(num_keys):
+            with cols[i % len(cols)]:
+                val = row.get(k)
+                display = _fmt_number(val) if isinstance(val, (int, float)) else "—"
+                st.metric(label=_humanize_col(k), value=display)
+
+
+def _render_multi_rows(rows: list[dict]) -> None:
+    """Pretty render for multi-row answers: a clean dataframe with
+    humanized headers, hidden scope columns."""
+    if not rows:
+        return
+    visible_cols = [k for k in rows[0].keys() if k not in _HIDDEN_COLUMNS]
+    cleaned = [
+        {_humanize_col(k): r.get(k) for k in visible_cols}
+        for r in rows
+    ]
+    st.dataframe(cleaned, use_container_width=True, hide_index=True)
+
+
 def render_answer(result: dict, index: int = 0) -> None:
     st.markdown(f"**You** · {result['question']}")
     st.markdown(f"**Assistant** &nbsp;&nbsp; {_confidence_badge(result['confidence'])}")
@@ -363,26 +447,49 @@ def render_answer(result: dict, index: int = 0) -> None:
     post = result.get("post_process", "none")
     rows = result.get("rows", [])
 
+    # Headline number(s) first — what the user actually asked for.
     if post == "yoy_pct" and result.get("yoy_changes"):
-        for ch in result["yoy_changes"]:
-            pct = f"{ch['pct_change']:+.2f}%" if ch["pct_change"] is not None else "n/a"
-            st.markdown(
-                f"- **{ch['metric']}**: {_fmt_number(ch['from_value'])} ({ch['from_period']}) "
-                f"→ {_fmt_number(ch['to_value'])} ({ch['to_period']}) &nbsp; **{pct}**"
-            )
+        cols = st.columns(min(len(result["yoy_changes"]), 4))
+        for i, ch in enumerate(result["yoy_changes"]):
+            with cols[i % len(cols)]:
+                pct = f"{ch['pct_change']:+.2f}%" if ch["pct_change"] is not None else "n/a"
+                st.metric(
+                    label=f"{_humanize_col(ch['metric'])} · {ch['from_period']} → {ch['to_period']}",
+                    value=pct,
+                    delta=f"{_fmt_number(ch['from_value'])} → {_fmt_number(ch['to_value'])}",
+                    delta_color="off",
+                )
     elif post == "ratio" and result.get("ratios"):
-        for r in result["ratios"]:
-            period_lbl = f" ({r['period']})" if r.get("period") else ""
-            val = f"{r['value']:.4f}" if r["value"] is not None else "n/a"
-            st.markdown(f"- **{r['numerator']} / {r['denominator']}**{period_lbl}: **{val}**")
+        cols = st.columns(min(len(result["ratios"]), 3))
+        for i, r in enumerate(result["ratios"]):
+            with cols[i % len(cols)]:
+                period_lbl = r.get("period") or ""
+                val = f"{r['value']*100:.2f}%" if r["value"] is not None else "—"
+                st.metric(
+                    label=f"{_humanize_col(r['numerator'])} ÷ {_humanize_col(r['denominator'])}"
+                          + (f" · {period_lbl}" if period_lbl else ""),
+                    value=val,
+                )
+    elif post == "ratio" and rows:
+        # The LLM asked for a ratio but the post-processor couldn't compute
+        # one (typically because one side of the row was NULL — e.g. the
+        # numerator's category-filter matched zero rows). Show the row
+        # cleanly so the user can see WHY.
+        if len(rows) == 1:
+            _render_single_row(rows[0])
+        else:
+            _render_multi_rows(rows)
+        st.caption(
+            "Ratio could not be computed — one side of the calculation was empty. "
+            "Check the row above; the filter probably matched no data."
+        )
     elif rows:
-        for r in rows[:3]:
-            parts = [f"**{k}**: {_fmt_number(v)}" for k, v in r.items()]
-            st.markdown("  ·  ".join(parts))
-        if len(rows) > 3:
-            st.caption(f"…and {len(rows) - 3} more rows. See *Source rows* below.")
+        if len(rows) == 1:
+            _render_single_row(rows[0])
+        else:
+            _render_multi_rows(rows)
     else:
-        st.markdown("_(no rows returned)_")
+        st.info("No rows returned.")
 
     st.markdown(f"> {result['explanation']}")
 
