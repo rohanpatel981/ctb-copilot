@@ -6,12 +6,13 @@ here when you ship S3 / Bedrock adapters — every call site in `query.py` and
 """
 
 import json
+import secrets
 import uuid
 from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -28,6 +29,28 @@ from ctb_copilot.tenants import TenantScope, TenantSync
 storage = LocalDiskStorage(settings.storage_dir)
 llm = AnthropicLLM(api_key=settings.anthropic_api_key, model=settings.anthropic_model)
 init_db(settings.duckdb_path)
+
+
+def verify_token(authorization: str | None = Header(default=None)) -> None:
+    """Bearer-token gate on the protected routes.
+
+    If `CTB_API_TOKEN` is not set in env, the API runs in dev mode and
+    this is a no-op. Once a token is configured (any multi-tenant
+    deployment SHOULD set one), every protected endpoint requires
+    `Authorization: Bearer <token>`.
+
+    Uses secrets.compare_digest to avoid timing-attack info leakage.
+    """
+    if not settings.api_token:
+        return
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization header required. Use: Authorization: Bearer <token>",
+        )
+    token = authorization.split(None, 1)[1].strip()
+    if not secrets.compare_digest(token, settings.api_token):
+        raise HTTPException(status_code=401, detail="Invalid token.")
 
 app = FastAPI(title="ctb-copilot", version="0.1.0")
 app.add_middleware(
@@ -103,7 +126,7 @@ def _tenant_where_sql() -> str:
     )
 
 
-@app.post("/upload", response_model=UploadResponse)
+@app.post("/upload", response_model=UploadResponse, dependencies=[Depends(verify_token)])
 async def upload(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -181,14 +204,14 @@ def _row_to_status(r: tuple) -> IngestionStatus:
     )
 
 
-@app.get("/uploads", response_model=list[IngestionStatus])
+@app.get("/uploads", response_model=list[IngestionStatus], dependencies=[Depends(verify_token)])
 def list_uploads() -> list[IngestionStatus]:
     with ro_connection(settings.duckdb_path) as conn:
         rows = conn.execute(_INGESTIONS_SELECT + " ORDER BY uploaded_at DESC").fetchall()
     return [_row_to_status(r) for r in rows]
 
 
-@app.get("/uploads/{upload_id}", response_model=IngestionStatus)
+@app.get("/uploads/{upload_id}", response_model=IngestionStatus, dependencies=[Depends(verify_token)])
 def get_upload(upload_id: str) -> IngestionStatus:
     with ro_connection(settings.duckdb_path) as conn:
         row = conn.execute(_INGESTIONS_SELECT + " WHERE id=?", [upload_id]).fetchone()
@@ -197,7 +220,7 @@ def get_upload(upload_id: str) -> IngestionStatus:
     return _row_to_status(row)
 
 
-@app.get("/periods")
+@app.get("/periods", dependencies=[Depends(verify_token)])
 def list_periods() -> list[dict]:
     """List loaded (client, fin_year_id, reporting_period_id) tuples with
     row counts. Multi-tenant aware — caller is expected to filter on
@@ -223,7 +246,7 @@ def list_periods() -> list[dict]:
     ]
 
 
-@app.get("/entities")
+@app.get("/entities", dependencies=[Depends(verify_token)])
 def list_entities() -> list[dict]:
     with ro_connection(settings.duckdb_path) as conn:
         rows = conn.execute(
@@ -239,7 +262,7 @@ def get_schema() -> dict:
     return {"ddl": LLM_SCHEMA_DDL}
 
 
-@app.post("/query", response_model=QueryResult)
+@app.post("/query", response_model=QueryResult, dependencies=[Depends(verify_token)])
 async def query(req: QueryRequest) -> QueryResult:
     if not req.question.strip():
         raise HTTPException(400, "question is required.")
@@ -301,7 +324,7 @@ def _run_sync_bg(sync_id: str, tenant: TenantSync, filter_doc: dict) -> None:
         pass
 
 
-@app.post("/sync", response_model=SyncResponse)
+@app.post("/sync", response_model=SyncResponse, dependencies=[Depends(verify_token)])
 def sync_from_docdb(req: SyncRequest, background_tasks: BackgroundTasks) -> SyncResponse:
     if not (settings.docdb_uri and settings.docdb_database and settings.docdb_collection):
         raise HTTPException(
@@ -340,7 +363,7 @@ def sync_from_docdb(req: SyncRequest, background_tasks: BackgroundTasks) -> Sync
     return SyncResponse(sync_id=sync_id, status="pending", filter_applied=filter_doc)
 
 
-@app.get("/sync/{sync_id}", response_model=IngestionStatus)
+@app.get("/sync/{sync_id}", response_model=IngestionStatus, dependencies=[Depends(verify_token)])
 def get_sync_status(sync_id: str) -> IngestionStatus:
     """Alias for /uploads/{id} — same data, different conceptual surface."""
     return get_upload(sync_id)

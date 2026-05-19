@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     api_port: int = 8000
     api_base_url: str = "http://127.0.0.1:8000"
 
+    # Optional bearer-token auth on /sync, /query, /upload, /uploads, /periods,
+    # /entities. If unset, the API runs in dev mode (no auth required). For any
+    # multi-tenant deployment this MUST be set — without it, a network caller
+    # can pass any tenant scope they like.
+    api_token: str | None = None
+
     # --- DocumentDB sync (optional) ---
     docdb_uri: str | None = None
     docdb_database: str | None = None
