@@ -29,6 +29,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # QEMU enables cross-architecture builds on the default x86 runner
+      # so we can produce arm64 images for Apple Silicon dev machines and
+      # AWS Graviton EC2 instances out of the same workflow.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -60,8 +66,12 @@ jobs:
         with:
           context: .
           push: true
+          # Build for both common cloud arches. arm64 covers Apple Silicon
+          # laptops + AWS Graviton EC2; amd64 covers regular Intel/AMD.
+          # arm64 builds via QEMU emulation are ~2-3x slower than native,
+          # but GHA cache makes incremental builds quick (~1-2 min).
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # GitHub Actions cache makes incremental builds ~30s instead of 3-4 min.
           cache-from: type=gha
           cache-to: type=gha,mode=max
