@@ -21,11 +21,14 @@ _SYSTEM_TEMPLATE = """You are a SQL query assistant for a consolidated trial bal
 
 The table has 6 tenant-identity columns: `client_id`, `gaap_id`, `reporting_parent_company_id`, `fin_year_id`, `reporting_period_id`, `currency_id`. **The server automatically adds WHERE clauses for the active tenant scope** (4 of these 6, always; the other 2 sometimes). You do NOT need to filter on them — your SQL will be rewritten to include the tenant filters before execution.
 
-When filtering by financial year, ALWAYS use the `fin_year_period` column (a human-readable label like 'FY 2024-25' supplied by the user at sync/upload time). Do NOT filter on `fin_year_id` or `reporting_period_id` — those are UUIDs that pin a single (year, period) combo and break cross-year queries.
+When filtering by financial year, ALWAYS use the `fin_year_period` column (a human-readable label supplied by the user at sync/upload time). Do NOT filter on `fin_year_id` or `reporting_period_id` — those are UUIDs that pin a single (year, period) combo and break cross-year queries.
 
-- Single-year question ("Total liabilities for FY 2024-25") → `WHERE fin_year_period = 'FY 2024-25'`
-- Cross-year comparison ("YoY", "FY 24-25 vs FY 25-26") → `WHERE fin_year_period IN ('FY 2024-25', 'FY 2025-26')`, GROUP BY `fin_year_period`
+**`fin_year_period` values are NOT standardised.** Different syncs may carry labels like `'FY 26-27'`, `'FY 2026-27'`, `'FY26-27'`, etc., depending on what the user typed in the engagement form. {periods_block}
+
+- Single-year question → `WHERE fin_year_period = '<exact value from the list>'`
+- Cross-year comparison → `WHERE fin_year_period IN ('<value 1>', '<value 2>')` and GROUP BY `fin_year_period`
 - If the user doesn't name a year, omit the filter entirely — the server's tenant scope handles it
+- If no value in the list plausibly matches the user's reference, omit the filter and say so in the explanation; **do NOT invent labels.**
 
 For aggregates, include `fin_year_period` in the SELECT so the analyst sees which year the answer covers.
 
@@ -90,7 +93,7 @@ Use `amount_reporting_ccy` if and only if:
 
 # How to handle common question shapes
 
-1. **Period filtering**: use `fin_year_period` (the human-readable label) — never `fin_year_id` or `reporting_period_id`. If the user names one year, use `WHERE fin_year_period = 'FY 2024-25'`. If multiple, use `IN (...)`.
+1. **Period filtering**: use `fin_year_period` with values picked from the "Available fin_year_period values" list above (exact `=` or `IN (...)`). Never use `fin_year_id` or `reporting_period_id`. Never invent labels not in the list.
 2. **Entity filtering**: use `entity_code` or `entity_name`. State which entities you included in the explanation.
 3. **High-level totals**: `SUM(amount_consolidated)` grouped by `fs_category` or `bs_classification`.
 4. **Year-over-year (YoY)**: `SELECT fin_year_period, SUM(amount_consolidated) FROM ctb_data WHERE fs_category = 'X' GROUP BY fin_year_period ORDER BY fin_year_period`. Then set `post_process` = "yoy_pct".
@@ -154,8 +157,24 @@ confidence: medium
 """
 
 
-def _build_system(schema_ddl: str) -> str:
-    return _SYSTEM_TEMPLATE.format(schema_ddl=schema_ddl)
+def _build_system(
+    schema_ddl: str,
+    available_fin_year_periods: list[str] | tuple[str, ...] = (),
+) -> str:
+    if available_fin_year_periods:
+        periods_repr = ", ".join(repr(p) for p in sorted(available_fin_year_periods))
+        periods_block = (
+            "\n\n**Available `fin_year_period` values in this tenant's data** "
+            f"(the only legal strings — match the user's intent to one of these): "
+            f"[{periods_repr}]."
+        )
+    else:
+        periods_block = (
+            "\n\n(No `fin_year_period` data has been synced for this tenant yet, "
+            "so any year filter the user asks for will return 0 rows. Skip the "
+            "filter and call this out in the explanation.)"
+        )
+    return _SYSTEM_TEMPLATE.format(schema_ddl=schema_ddl, periods_block=periods_block)
 
 
 class AnthropicLLM:
@@ -171,8 +190,9 @@ class AnthropicLLM:
         schema_ddl: str,
         sample_rows: str = "",
         question: str,
+        available_fin_year_periods: list[str] | tuple[str, ...] = (),
     ) -> SQLPlan:
-        system_text = _build_system(schema_ddl)
+        system_text = _build_system(schema_ddl, available_fin_year_periods)
         response = await self.client.messages.parse(
             model=self.model,
             max_tokens=4096,
