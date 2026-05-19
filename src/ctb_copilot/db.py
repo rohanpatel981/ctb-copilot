@@ -219,10 +219,21 @@ def rw_connection(path: Path) -> Iterator[duckdb.DuckDBPyConnection]:
 
 @contextmanager
 def ro_connection(path: Path) -> Iterator[duckdb.DuckDBPyConnection]:
-    """Read-only connection. Used by the query path as defence-in-depth on top
-    of SQL validation — even if a non-SELECT slipped through the parser, the
-    DB itself would reject the write."""
-    conn = duckdb.connect(str(path), read_only=True)
+    """Read connection used by query, list, and status endpoints.
+
+    Historically opened with read_only=True as defence-in-depth on top of the
+    sqlglot SELECT-only validator. DuckDB, however, refuses to open a RO
+    connection while any RW connection (or its in-process metadata cache) is
+    live on the same file:
+
+        ConnectionException: Can't open a connection to same database file
+        with a different configuration than existing connections
+
+    This collides with the sync background task, which holds a RW connection
+    for the duration of a sync, so every UI poll during a sync 500s. Drop the
+    flag and rely on the SELECT-only validator in `query.py` for write safety.
+    """
+    conn = duckdb.connect(str(path))
     try:
         yield conn
     finally:
