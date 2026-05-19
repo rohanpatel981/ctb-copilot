@@ -152,10 +152,17 @@ def _project_console_append_tb(doc: dict[str, Any]) -> dict[str, Any]:
         fctrAmount                    → each {value, …}
       - totalBalance                  → running consolidated total
 
-    AppendTB is the row-level pivot: every adjustment module ($inc-s) into
-    one of the *Amount fields, and totalBalance is kept in sync as
-        totalBalance == amountInLocalCurrency.value + Σ(all adj_*).
-    So the canonical reconciliation invariant holds by construction.
+    AppendTB is the row-level pivot: every adjustment module $inc-s into
+    one of the *Amount fields. The CLAUDE.md docs describe `totalBalance`
+    as "running sum of all the above plus base TB amount", but in practice
+    `totalBalance` lags or is zero until adjustment-posting starts — fresh
+    scopes have `totalBalance=0` even when `amountInLocalCurrency.value`
+    holds the base TB and adjustments are 0. Trusting totalBalance directly
+    breaks the reconciliation invariant for these scopes.
+
+    Compute it instead: amount_consolidated = amount_reporting_ccy + Σ adj_*.
+    This is the reconciliation invariant by definition, so it always holds,
+    and once the platform fully populates totalBalance the two agree.
     """
 
     def _val(field: str) -> float | None:
@@ -165,6 +172,18 @@ def _project_console_append_tb(doc: dict[str, Any]) -> dict[str, Any]:
         return None
 
     func = doc.get("amountInFunctionalCurrency") or {}
+    reporting = _val("amountInLocalCurrency")
+    adjustments = [
+        _val("otherAdjustmentAmount"),
+        _val("nciAmount"),
+        _val("goodWillAmount"),
+        _val("ppaAmount"),
+        _val("iceAmount"),
+        _val("iceShareCapitalAmount"),
+        _val("retainedEarningsAmount"),
+        _val("fctrAmount"),
+    ]
+    consolidated = (reporting or 0.0) + sum((a or 0.0) for a in adjustments)
     return {
         "consol_gl_code": doc.get("consoleGlCode"),
         "consol_gl_description": doc.get("consoleGlDesc"),
@@ -178,16 +197,16 @@ def _project_console_append_tb(doc: dict[str, Any]) -> dict[str, Any]:
         "sub_grouping": doc.get("subGroupings"),
         "functional_currency": func.get("currency") if isinstance(func, dict) else None,
         "amount_functional_ccy": func.get("value") if isinstance(func, dict) else None,
-        "amount_reporting_ccy": _val("amountInLocalCurrency"),
-        "adj_other_consolidated": _val("otherAdjustmentAmount"),
-        "adj_nci": _val("nciAmount"),
-        "adj_goodwill": _val("goodWillAmount"),
-        "adj_ppa": _val("ppaAmount"),
-        "adj_intercompany": _val("iceAmount"),
-        "adj_investment_capital": _val("iceShareCapitalAmount"),
-        "adj_retained_earnings": _val("retainedEarningsAmount"),
-        "adj_fctr": _val("fctrAmount"),
-        "amount_consolidated": doc.get("totalBalance"),
+        "amount_reporting_ccy": reporting,
+        "adj_other_consolidated": adjustments[0],
+        "adj_nci": adjustments[1],
+        "adj_goodwill": adjustments[2],
+        "adj_ppa": adjustments[3],
+        "adj_intercompany": adjustments[4],
+        "adj_investment_capital": adjustments[5],
+        "adj_retained_earnings": adjustments[6],
+        "adj_fctr": adjustments[7],
+        "amount_consolidated": consolidated,
     }
 
 
