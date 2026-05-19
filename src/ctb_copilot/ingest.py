@@ -12,6 +12,7 @@ from pathlib import Path
 from python_calamine import CalamineWorkbook
 
 from ctb_copilot.db import rw_connection
+from ctb_copilot.tenants import TENANT_ID_COLUMNS, TenantSync
 
 COLUMN_MAP: list[tuple[int, str]] = [
     (0, "consol_gl_code"),
@@ -164,7 +165,8 @@ def _parse(path: Path) -> tuple[list[str], list[list]]:
 
 
 _INSERT_COLUMNS = [
-    "upload_id", "row_number", "period",
+    "upload_id", "row_number",
+    *TENANT_ID_COLUMNS,  # 6 tenant ID columns (client_id, gaap_id, ...)
     *[canonical for _, canonical in COLUMN_MAP],
 ]
 _INSERT_SQL = (
@@ -230,39 +232,53 @@ def ingest_file(
     db_path: Path,
     source_path: Path,
     *,
-    period: str,
+    tenant: TenantSync,
     upload_id: str | None = None,
     original_filename: str | None = None,
 ) -> tuple[str, int]:
-    """Parse `source_path` and insert into ctb_data under `period`.
+    """Parse `source_path` and insert into ctb_data under `tenant`.
 
     Returns (upload_id, row_count). Raises IngestError on schema mismatch.
 
-    If `upload_id` is provided, assumes the API layer has already inserted an
-    ingestions row in 'pending' state (so the user could see status immediately
-    on upload). Otherwise creates a fresh row.
+    Every ingested row carries all 6 tenant IDs so data is scoped to the
+    (clientId, gaapId, reportingParentCompanyId, finYearId,
+     reportingPeriodId, currencyId) tuple. Re-uploads to the same tuple
+    are handled by the API layer's override semantics.
+
+    If `upload_id` is provided, assumes the API layer has already inserted
+    an ingestions row in 'pending' state. Otherwise creates a fresh row.
     """
     pre_registered = upload_id is not None
     upload_id = upload_id or str(uuid.uuid4())
     filename = original_filename or source_path.name
+    tenant_dict = tenant.as_dict()
 
     with rw_connection(db_path) as conn:
         if pre_registered:
             conn.execute("UPDATE ingestions SET status='reading' WHERE id=?", [upload_id])
         else:
             conn.execute(
-                "INSERT INTO ingestions (id, filename, period, status) VALUES (?, ?, ?, 'reading')",
-                [upload_id, filename, period],
+                "INSERT INTO ingestions (id, filename, status, client_id, gaap_id, "
+                "reporting_parent_company_id, fin_year_id, reporting_period_id, currency_id) "
+                "VALUES (?, ?, 'reading', ?, ?, ?, ?, ?, ?)",
+                [
+                    upload_id, filename,
+                    tenant_dict["client_id"], tenant_dict["gaap_id"],
+                    tenant_dict["reporting_parent_company_id"],
+                    tenant_dict["fin_year_id"], tenant_dict["reporting_period_id"],
+                    tenant_dict["currency_id"],
+                ],
             )
 
     try:
         headers, raw_rows = _parse(source_path)
         validate_headers(headers)
 
+        tenant_values = [tenant_dict[col] for col in TENANT_ID_COLUMNS]
         prepared: list[list] = []
         for i, row in enumerate(raw_rows):
             padded = list(row) + [None] * max(0, 22 - len(row))
-            record: list = [upload_id, i + 2, period]
+            record: list = [upload_id, i + 2, *tenant_values]
             for idx, canonical in COLUMN_MAP:
                 raw = padded[idx]
                 if canonical in TEXT_COLS:

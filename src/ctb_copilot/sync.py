@@ -41,15 +41,17 @@ from ctb_copilot.ingest import (
 )
 from ctb_copilot.ingest import TEXT_COLS
 from ctb_copilot.ports.source import DatabaseSource, SyncProgress
+from ctb_copilot.tenants import TENANT_ID_COLUMNS, TenantSync
 
 _STAGING_INSERT_SQL = (
     f"INSERT INTO ctb_data_staging ({', '.join(_INSERT_COLUMNS)}) "
     f"VALUES ({', '.join(['?'] * len(_INSERT_COLUMNS))})"
 )
 
-# Canonical fields the source must yield (everything except the three
-# provenance columns prepended by the orchestrator).
-_CANONICAL_DATA_FIELDS = tuple(name for name in _INSERT_COLUMNS if name not in ("upload_id", "row_number", "period"))
+# Provenance + tenant columns are filled by the orchestrator; the rest
+# (the 22 canonical TB fields) come from the source DB.
+_PROVENANCE_COLUMNS = frozenset(("upload_id", "row_number", *TENANT_ID_COLUMNS))
+_CANONICAL_DATA_FIELDS = tuple(name for name in _INSERT_COLUMNS if name not in _PROVENANCE_COLUMNS)
 
 
 def _build_record(
@@ -57,15 +59,17 @@ def _build_record(
     *,
     upload_id: str,
     row_number: int,
-    period: str,
+    tenant: TenantSync,
 ) -> list[Any]:
-    """Convert a canonical-shape source-row dict into the 25-element list
-    that matches `_INSERT_COLUMNS` order, applying the same text/number
-    coercion the Excel ingest path uses."""
+    """Convert a canonical-shape source-row dict into the record list
+    that matches `_INSERT_COLUMNS` order. Tags the row with all 6 tenant
+    IDs so it lives only inside the tuple it was synced for."""
     record: list[Any] = [None] * len(_INSERT_COLUMNS)
     record[_COL_IDX["upload_id"]] = upload_id
     record[_COL_IDX["row_number"]] = row_number
-    record[_COL_IDX["period"]] = period
+    tenant_dict = tenant.as_dict()
+    for col in TENANT_ID_COLUMNS:
+        record[_COL_IDX[col]] = tenant_dict[col]
     for field in _CANONICAL_DATA_FIELDS:
         raw = row_dict.get(field)
         if field in TEXT_COLS:
@@ -73,6 +77,9 @@ def _build_record(
         else:
             record[_COL_IDX[field]] = _coerce_numeric(raw)
     return record
+
+
+_TENANT_WHERE_CLAUSE = " AND ".join(f"{col} = ?" for col in TENANT_ID_COLUMNS)
 
 
 class SyncError(Exception):
@@ -90,13 +97,20 @@ def run_sync(
     sync_id: str,
     source: DatabaseSource,
     filter_doc: dict[str, Any],
-    period: str,
+    tenant: TenantSync,
     db_path: Path,
 ) -> int:
     """Run a sync against the configured source. Returns the number of
     rows inserted. Raises SyncError on failure (after writing the failure
-    state to the ingestions table)."""
+    state to the ingestions table).
+
+    The atomic swap on success scopes to the full 6-tuple of tenant IDs,
+    so a re-sync replaces only THAT tenant's data and never touches rows
+    belonging to any other (client, gaap, parent, year, period, currency).
+    """
     conn = duckdb.connect(str(db_path))
+    tenant_values = list(tenant.as_dict().values())  # ordered by TENANT_ID_COLUMNS
+
     try:
         conn.execute("UPDATE ingestions SET status='running' WHERE id=?", [sync_id])
 
@@ -107,7 +121,7 @@ def run_sync(
             conn.execute("UPDATE ingestions SET row_count=? WHERE id=?", [total, sync_id])
 
         progress = SyncProgress(on_batch=_on_batch)
-        row_number_counter = {"n": 1}  # mirror Excel's "row 1 = header" convention
+        row_number_counter = {"n": 1}
 
         try:
             for batch_dicts in source.stream_rows(filter_doc=filter_doc, progress=progress):
@@ -120,20 +134,27 @@ def run_sync(
                         d,
                         upload_id=sync_id,
                         row_number=row_number_counter["n"],
-                        period=period,
+                        tenant=tenant,
                     ))
                 validate_reconciliation(records)
                 conn.executemany(_STAGING_INSERT_SQL, records)
 
-            # Atomic swap — wrap in a transaction so a failure here doesn't
-            # leave ctb_data with the wrong period's data half-written.
+            # Atomic swap — replace ONLY this tenant's data. Other
+            # tenants' rows are structurally untouchable here because the
+            # WHERE clause names all 6 IDs.
             conn.execute("BEGIN TRANSACTION")
             try:
+                # Mark prior 'done' ingestions for the same tenant tuple
+                # as 'replaced' (audit trail preserved).
                 conn.execute(
-                    "UPDATE ingestions SET status='replaced' WHERE period=? AND status='done' AND id != ?",
-                    [period, sync_id],
+                    f"UPDATE ingestions SET status='replaced' "
+                    f"WHERE status='done' AND id != ? AND {_TENANT_WHERE_CLAUSE}",
+                    [sync_id, *tenant_values],
                 )
-                conn.execute("DELETE FROM ctb_data WHERE period = ?", [period])
+                conn.execute(
+                    f"DELETE FROM ctb_data WHERE {_TENANT_WHERE_CLAUSE}",
+                    tenant_values,
+                )
                 conn.execute(
                     "INSERT INTO ctb_data SELECT * FROM ctb_data_staging WHERE upload_id = ?",
                     [sync_id],
