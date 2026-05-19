@@ -23,7 +23,7 @@ from ctb_copilot.db import LLM_SCHEMA_DDL, init_db, ro_connection, rw_connection
 from ctb_copilot.ingest import ingest_file
 from ctb_copilot.query import QueryResult, UnsafeSQLError, run_query
 from ctb_copilot.sync import SyncError, run_sync
-from ctb_copilot.tenants import TenantSync
+from ctb_copilot.tenants import TenantScope, TenantSync
 
 storage = LocalDiskStorage(settings.storage_dir)
 llm = AnthropicLLM(api_key=settings.anthropic_api_key, model=settings.anthropic_model)
@@ -59,6 +59,7 @@ class IngestionStatus(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
+    scope: TenantScope
 
 
 class SyncRequest(BaseModel):
@@ -243,7 +244,12 @@ async def query(req: QueryRequest) -> QueryResult:
     if not req.question.strip():
         raise HTTPException(400, "question is required.")
     try:
-        return await run_query(question=req.question, llm=llm, db_path=settings.duckdb_path)
+        return await run_query(
+            question=req.question,
+            scope=req.scope,
+            llm=llm,
+            db_path=settings.duckdb_path,
+        )
     except UnsafeSQLError as e:
         raise HTTPException(400, f"Generated SQL rejected by safety check: {e}") from e
 

@@ -16,13 +16,35 @@ import yaml
 from ctb_copilot.eval.grader import CaseResult, GoldenCase, format_report, grade_case
 from ctb_copilot.ports.llm import LLMProvider
 from ctb_copilot.query import run_query
+from ctb_copilot.tenants import TenantScope
 
 
-def load_cases(yaml_path: Path) -> list[GoldenCase]:
+def load_cases(yaml_path: Path) -> tuple[TenantScope, list[GoldenCase]]:
+    """Parse a golden file. Top-level shape can be either:
+      - a list of cases (legacy; uses a default eval scope), or
+      - a dict with `scope: {...}` and `cases: [...]`.
+    """
     raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, list):
-        raise ValueError(f"{yaml_path} must contain a top-level list of cases.")
-    return [GoldenCase.model_validate(c) for c in raw]
+    if isinstance(raw, list):
+        return _default_eval_scope(), [GoldenCase.model_validate(c) for c in raw]
+    if isinstance(raw, dict) and "cases" in raw:
+        scope_data = raw.get("scope") or _default_eval_scope_dict()
+        scope = TenantScope.model_validate(scope_data)
+        return scope, [GoldenCase.model_validate(c) for c in raw["cases"]]
+    raise ValueError(f"{yaml_path} must be a list of cases or a {{scope, cases}} dict.")
+
+
+def _default_eval_scope_dict() -> dict[str, str]:
+    return {
+        "clientId": "demo-client",
+        "gaapId": "ind_as",
+        "reportingParentCompanyId": "demo-rpc",
+        "currencyId": "INR",
+    }
+
+
+def _default_eval_scope() -> TenantScope:
+    return TenantScope.model_validate(_default_eval_scope_dict())
 
 
 async def run_eval(
@@ -30,11 +52,11 @@ async def run_eval(
     llm: LLMProvider,
     db_path: Path,
 ) -> list[CaseResult]:
-    cases = load_cases(yaml_path)
+    scope, cases = load_cases(yaml_path)
     results: list[CaseResult] = []
     for case in cases:
         try:
-            qr = await run_query(question=case.question, llm=llm, db_path=db_path)
+            qr = await run_query(question=case.question, scope=scope, llm=llm, db_path=db_path)
             results.append(grade_case(case, qr.model_dump()))
         except Exception as e:
             results.append(grade_case(case, None, error=f"{type(e).__name__}: {e}"))

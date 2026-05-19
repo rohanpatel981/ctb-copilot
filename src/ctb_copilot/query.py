@@ -13,6 +13,7 @@ from sqlglot import exp, parse_one
 
 from ctb_copilot.db import LLM_SCHEMA_DDL, ro_connection
 from ctb_copilot.ports.llm import LLMProvider, SQLPlan
+from ctb_copilot.tenants import TenantScope
 
 
 class YoYChange(BaseModel):
@@ -62,6 +63,64 @@ def validate_safe_select(sql: str) -> None:
     for node in tree.walk():
         if isinstance(node, _FORBIDDEN_NODES):
             raise UnsafeSQLError(f"Forbidden statement type: {type(node).__name__}.")
+
+
+def _select_scans_ctb_data_directly(select: exp.Select) -> bool:
+    """True iff this Select's own FROM / JOINs scan ctb_data (not via a
+    subquery). Subqueries' Selects are handled separately when find_all
+    iterates them in their own right.
+
+    Note: sqlglot's args dict uses `from_` (with trailing underscore),
+    not `from`, since the latter is a Python keyword.
+    """
+    from_arg = select.args.get("from_")
+    if from_arg is not None:
+        from_this = from_arg.this if hasattr(from_arg, "this") else from_arg
+        if isinstance(from_this, exp.Table) and from_this.name == "ctb_data":
+            return True
+    for join in select.args.get("joins") or []:
+        join_this = join.this if hasattr(join, "this") else None
+        if isinstance(join_this, exp.Table) and join_this.name == "ctb_data":
+            return True
+    return False
+
+
+def inject_tenant_filters(sql: str, scope) -> str:
+    """Rewrite `sql` so every Select that scans ctb_data has the tenant
+    scope ANDed into its WHERE clause.
+
+    Server-side defense: even if Claude's SQL forgets to filter by tenant,
+    the rewriter guarantees cross-tenant data leakage is structurally
+    impossible. Called AFTER validate_safe_select so we know the input is
+    a single SELECT-shaped tree.
+
+    The rewrite is purely additive — only AND-clauses are added — so it
+    can never turn a safe SELECT into a destructive statement.
+    """
+    pairs = scope.as_filter_pairs()
+    if not pairs:
+        return sql
+    tree = parse_one(sql, dialect="duckdb")
+    if tree is None:
+        return sql
+
+    def _rewrite(node):
+        if isinstance(node, exp.Select) and _select_scans_ctb_data_directly(node):
+            # sqlglot's where(..., append=True) returns a NEW Select with
+            # the AND-joined predicate; chain them in order to build up
+            # the full tenant filter on this node, then return the result
+            # so transform() can splice it in.
+            modified = node
+            for col, value in pairs:
+                modified = modified.where(
+                    exp.column(col).eq(exp.Literal.string(value)),
+                    append=True,
+                )
+            return modified
+        return node
+
+    tree = tree.transform(_rewrite)
+    return tree.sql(dialect="duckdb")
 
 
 def _compute_yoy(rows: list[dict], columns: list[str]) -> list[YoYChange]:
@@ -119,15 +178,23 @@ def _compute_ratio(rows: list[dict], columns: list[str]) -> list[dict]:
     return ratios
 
 
-async def run_query(*, question: str, llm: LLMProvider, db_path: Path) -> QueryResult:
+async def run_query(*, question: str, scope: TenantScope, llm: LLMProvider, db_path: Path) -> QueryResult:
     plan: SQLPlan = await llm.generate_sql_plan(
         schema_ddl=LLM_SCHEMA_DDL,
         question=question,
     )
     validate_safe_select(plan.sql)
 
+    # Server-enforced tenant scoping. Even if Claude's SQL forgets the
+    # tenant filters, the rewriter adds them. Re-validate the rewritten
+    # SQL as defense-in-depth — the rewrite is additive (AND-only) so
+    # this should always succeed, but if it ever fails we want a 4xx not
+    # a corrupt execution.
+    executed_sql = inject_tenant_filters(plan.sql, scope)
+    validate_safe_select(executed_sql)
+
     with ro_connection(db_path) as conn:
-        cursor = conn.execute(plan.sql)
+        cursor = conn.execute(executed_sql)
         columns = [d[0] for d in cursor.description]
         rows_raw = cursor.fetchall()
     rows = [dict(zip(columns, r)) for r in rows_raw]
@@ -141,7 +208,7 @@ async def run_query(*, question: str, llm: LLMProvider, db_path: Path) -> QueryR
 
     return QueryResult(
         question=question,
-        sql=plan.sql,
+        sql=executed_sql,
         explanation=plan.explanation,
         columns=columns,
         rows=rows,
