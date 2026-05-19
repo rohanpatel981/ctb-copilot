@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     docdb_period_field: str | None = None
     docdb_reporting_period: str | None = None
     docdb_reporting_period_field: str = "reporting_period_id"
+    # Selects which doc → canonical mapping to use during sync. "canonical"
+    # expects the source collection's field names to already match the
+    # canonical names (the original v0.3 assumption). "consolidation_final_tb"
+    # handles the Java/Spring `ConsolidationFinalTB` shape used by the Uniqus
+    # consolidation platform (camelCase + nested currency-conversion objects).
+    docdb_doc_shape: str = "canonical"
 
     @field_validator("docdb_default_filter", mode="before")
     @classmethod

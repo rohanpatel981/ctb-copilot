@@ -311,6 +311,7 @@ def _run_sync_bg(sync_id: str, tenant: TenantSync, filter_doc: dict) -> None:
         uri=settings.docdb_uri,
         database=settings.docdb_database,
         collection=settings.docdb_collection,
+        doc_shape=settings.docdb_doc_shape,
     )
     try:
         run_sync(

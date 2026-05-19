@@ -86,13 +86,86 @@ def _project_doc(doc: dict[str, Any]) -> dict[str, Any]:
     return {field: doc.get(field) for field in CANONICAL_FIELDS}
 
 
+def _project_consolidation_final_tb(doc: dict[str, Any]) -> dict[str, Any]:
+    """Map a Uniqus `ConsolidationFinalTB` Mongo document to the canonical
+    22-column shape.
+
+    Source shape (Java/Spring `com.uniqus.core.models.mongo.ConsolidationFinalTB`):
+      - consoleGlCode, consoleGlDesc, entityGlName
+      - fsType ("Balance Sheet" / "Statement of P&L")
+      - fsCategory, fsSubCategory, fsli, groupings, subGroupings
+      - amountInFunctionalCurrency  → {currency, value, rateType}
+      - amountInLocalCurrencyRecord → list[{currency, value, rateType}]
+
+    Final-TB rows already carry the consolidated number (this is the
+    post-consolidation collection), so the per-adjustment columns are set
+    to 0.0. The reconciliation invariant
+        amount_consolidated == amount_reporting_ccy + Σ(adj_*)
+    holds trivially because reporting == consolidated and adjustments are 0.
+    """
+    func = doc.get("amountInFunctionalCurrency") or {}
+    local_records = doc.get("amountInLocalCurrencyRecord") or []
+    # FinalTB stores the reporting-currency value as a list (one entry per
+    # rate-conversion path). Summing is safe: single-rate rows have one
+    # entry; multi-rate rows each represent an independent slice that adds
+    # to the consolidated total.
+    consolidated = float(sum((rec.get("value") or 0.0) for rec in local_records))
+    entity = doc.get("entityGlName")
+    return {
+        "consol_gl_code": doc.get("consoleGlCode"),
+        "consol_gl_description": doc.get("consoleGlDesc"),
+        "entity_name": entity,
+        "entity_code": entity,  # FinalTB has no separate code; mirror the name
+        "gl_nature": doc.get("fsType"),
+        "fs_category": doc.get("fsCategory"),
+        "bs_classification": doc.get("fsSubCategory"),
+        "fsli": doc.get("fsli"),
+        "grouping": doc.get("groupings"),
+        "sub_grouping": doc.get("subGroupings"),
+        "functional_currency": func.get("currency"),
+        "amount_functional_ccy": func.get("value"),
+        "amount_reporting_ccy": consolidated,
+        "adj_other_consolidated": 0.0,
+        "adj_nci": 0.0,
+        "adj_goodwill": 0.0,
+        "adj_ppa": 0.0,
+        "adj_intercompany": 0.0,
+        "adj_investment_capital": 0.0,
+        "adj_retained_earnings": 0.0,
+        "adj_fctr": 0.0,
+        "amount_consolidated": consolidated,
+    }
+
+
+_PROJECTORS = {
+    "canonical": _project_doc,
+    "consolidation_final_tb": _project_consolidation_final_tb,
+}
+
+
+def _project_for(shape: str):
+    """Look up the projector for a given DOCDB_DOC_SHAPE."""
+    if shape not in _PROJECTORS:
+        raise ValueError(
+            f"Unknown DOCDB_DOC_SHAPE={shape!r}. Expected one of {list(_PROJECTORS)}."
+        )
+    return _PROJECTORS[shape]
+
+
 class DocumentDBSource(DatabaseSource):
     """pymongo-backed implementation of DatabaseSource for AWS DocumentDB."""
 
-    def __init__(self, uri: str, database: str, collection: str) -> None:
+    def __init__(
+        self,
+        uri: str,
+        database: str,
+        collection: str,
+        doc_shape: str = "canonical",
+    ) -> None:
         self.uri = uri
         self.database = database
         self.collection_name = collection
+        self.project = _project_for(doc_shape)
 
     def stream_rows(
         self,
@@ -114,7 +187,7 @@ class DocumentDBSource(DatabaseSource):
             cursor = collection.find(filter_doc, batch_size=batch_size)
             batch: list[dict[str, Any]] = []
             for doc in cursor:
-                batch.append(_project_doc(doc))
+                batch.append(self.project(doc))
                 if len(batch) >= batch_size:
                     if progress is not None:
                         progress.report(len(batch))
