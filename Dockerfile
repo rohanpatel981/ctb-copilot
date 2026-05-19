@@ -22,6 +22,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Now copy source + install the project itself.
 COPY src ./src
 COPY README.md LICENSE ./
+# Streamlit reads ./.streamlit/config.toml from the working dir for theme
+# + server defaults. Copy it so the container picks up the brand theme.
+COPY .streamlit ./.streamlit
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
