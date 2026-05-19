@@ -4,21 +4,27 @@
 
 Built for chartered accountants and finance teams running consolidation across multiple entities, currencies, and financial years. Every answer carries its receipts so the analyst can paste it straight into working papers and the engagement manager can sign off without re-running it from scratch.
 
-> Public preview, v0.4 — one-command Docker deployment. `docker compose up -d` and you're running, no Python toolchain required on the host. Combined with v0.3's DocumentDB sync, v0.2's eval harness + Excel export + ingestion guards, and the 43-test suite, this is the first version a CA firm IT admin can deploy in 5 minutes. S3 storage and auth land in v1.0.
+> Public preview, v0.5 — multi-tenant. One deployment safely serves many CA engagements, each scoped by the 6-tuple `(clientId, gaapId, reportingParentCompanyId, finYearId, reportingPeriodId, currencyId)`. Tenant isolation is structural: every row carries all 6 IDs, every query is server-rewritten via sqlglot to include the tenant scope. Plus the v0.4 one-command Docker deployment, v0.3 DocumentDB sync, v0.2 eval harness + Excel export, and a 63-test suite. S3 storage and SSO land in v1.0.
 
 ## What it does, in one example
 
 ```
-You ▸ "What's the total of current liabilities for FY 2024-25?"
+Active engagement:
+  clientId = "abc-123"  gaapId = "ind_as"  rpc = "rpc-001"
+  currencyId = "INR"    finYearId = "FY 2024-25"  reportingPeriodId = "Annual"
+
+You ▸ "What's the total of current liabilities?"
 
 Assistant ▸  ₹ (37.84) Cr   (negative per trial-balance convention)
 
-  ▸ View SQL
-      SELECT period, bs_classification, SUM(amount_consolidated) AS total
+  ▸ View SQL  (the tenant filters are server-injected — even if Claude omitted them)
+      SELECT bs_classification, SUM(amount_consolidated) AS total
       FROM ctb_data
-      WHERE period = 'FY 2024-25'
-        AND bs_classification = 'Current liabilities'
-      GROUP BY period, bs_classification;
+      WHERE bs_classification = 'Current liabilities'
+        AND client_id = 'abc-123' AND gaap_id = 'ind_as'
+        AND reporting_parent_company_id = 'rpc-001' AND currency_id = 'INR'
+        AND fin_year_id = 'FY 2024-25' AND reporting_period_id = 'Annual'
+      GROUP BY bs_classification;
 
   ▸ View 247 source rows
       [paginated table — every row that contributed to the total]
@@ -40,9 +46,21 @@ You need Docker — [Docker Desktop](https://www.docker.com/products/docker-desk
 git clone https://github.com/rohanpatel981/ctb-copilot
 cd ctb-copilot
 cp .env.example .env
-$EDITOR .env                # paste ANTHROPIC_API_KEY (and DOCDB_* if you want sync)
+$EDITOR .env                # paste ANTHROPIC_API_KEY (+ DOCDB_* + API_TOKEN)
 docker compose up -d        # builds the image, starts both services
 ```
+
+Required `.env` values for a multi-tenant deployment:
+
+```sh
+ANTHROPIC_API_KEY=sk-ant-...                          # for LLM calls
+API_TOKEN=<long-random-secret>                        # Bearer token gating /sync /query /upload
+DOCDB_URI=mongodb://...                               # if you want DocumentDB sync
+DOCDB_DATABASE=accounting
+DOCDB_COLLECTION=consolidated_tb
+```
+
+For dev work on a laptop, you can omit `API_TOKEN` and the API runs without auth.
 
 That's it. Open <http://localhost:8501>.
 
@@ -102,6 +120,35 @@ There is no black-box step. Two layers of safety also gate the SQL itself: a `sq
 A third guardrail runs at **ingestion** time. Every uploaded CTB has to satisfy the reconciliation invariant on every row: `amount_consolidated = amount_reporting_ccy + Σ(adj_*)`. If even one row fails (within `math.isclose` tolerance), the upload is rejected with a list of the offending Excel row numbers and the actual/computed/diff values. Hand-edited CTBs and producer bugs get caught before they can produce wrong Q&A answers.
 
 Files that aren't a consolidated TB at all (mapping tables, entity-level TBs) get a context-rich rejection that names what the file probably is, not a generic "wrong column count" message.
+
+## Multi-tenant model
+
+One ctb-copilot deployment safely serves many engagements. Every CTB row is tagged with a 6-tuple identity:
+
+| Field | Example | Source |
+|---|---|---|
+| `clientId` | `"abc-123"` | The CA firm's internal client ID |
+| `gaapId` | `"ind_as"` / `"ifrs"` / `"us_gaap"` | Accounting standard the books are kept under |
+| `reportingParentCompanyId` | `"rpc-001"` | The consolidation parent within the client's group |
+| `finYearId` | `"FY 2024-25"` | Financial year |
+| `reportingPeriodId` | `"Annual"` / `"Q1"` / `"Q4"` | Intra-year cadence |
+| `currencyId` | `"INR"` / `"USD"` | Reporting currency |
+
+**Tenant isolation is structural, not advisory.** Every query is rewritten server-side (via `sqlglot`) to AND those 6 filters into the WHERE clause of any Select that touches `ctb_data` — even if the LLM forgets, even in subqueries, even in CTEs. Cross-tenant data leakage at query time is impossible by design, not by convention.
+
+At sync time, all 6 are required and become both the Mongo filter (so DocumentDB returns only the right docs) and the row tag (so the data is permanently scoped). Re-syncing one tenant's data atomically replaces only that tenant's rows; other tenants are untouchable.
+
+The FE (the parent portal, or our default Streamlit UI) maintains an "active engagement" — the current 6-tuple — and threads it through every API call:
+
+```
+POST /sync                      POST /query                       POST /upload
+{ filter: TenantSync }          { question, scope: TenantScope }  multipart/form-data
+  ↑                               ↑                                 ↑ same 6 fields
+  all 6 required                  4 required + 2 optional
+                                  (omit finYearId for YoY)
+```
+
+For demo and dev mode, leave `API_TOKEN` unset in `.env` — the API runs without auth. For production, **set `API_TOKEN`** and every protected endpoint requires `Authorization: Bearer <token>`.
 
 ## Where the data lives
 
@@ -208,7 +255,7 @@ The codebase uses the ports-and-adapters pattern so the storage backend and LLM 
 
 ```sh
 uv sync --extra dev
-uv run pytest                    # 43 unit tests (grader + export + sync, no LLM/Mongo needed)
+uv run pytest                    # 63 unit tests (grader + export + sync + injection + auth, no LLM/Mongo needed)
 uv run ruff check src/           # lint
 uv run ctb-eval                  # run the eval suite (needs ANTHROPIC_API_KEY in .env)
 ```
@@ -240,10 +287,12 @@ src/ctb_copilot/
     └── source_docdb.py    AWS DocumentDB (pymongo) — batched cursor + filter merge
 
 tests/
-├── test_grader.py         14 tests covering every check type
-├── test_export.py          9 tests covering the workbook builder
-├── test_source_docdb.py   14 tests for filter merging + batched streaming (mocked pymongo)
-└── test_sync.py            6 tests for atomic-swap orchestrator (real DuckDB, fake source)
+├── test_grader.py             14 tests covering every check type
+├── test_export.py              9 tests covering the workbook builder
+├── test_source_docdb.py       14 tests for filter merging + batched streaming (mocked pymongo)
+├── test_sync.py                7 tests for atomic-swap orchestrator + multi-tenant isolation
+├── test_query_injection.py    12 tests for sqlglot tenant-filter rewriting
+└── test_auth.py                7 tests for the bearer-token verifier
 ```
 
 To add an adapter (e.g. S3 storage, Bedrock LLM), implement the Protocol in `ports/` and wire it in `api.py`. Business logic depends on the Protocol, not the concrete class.
@@ -291,17 +340,28 @@ The runner prints a pass/fail table per case + per check, and exits non-zero if 
 - Bind-mounted `./data` volume keeps DuckDB + uploads on host disk
 - README now leads with the Docker quick-start; `uv` path stays as the dev alternative
 
-**v0.5 — next:**
+**v0.5 — shipped:**
+- Multi-tenant data model — every row tagged with the 6-tuple `(clientId, gaapId, reportingParentCompanyId, finYearId, reportingPeriodId, currencyId)`
+- Atomic-swap orchestration scoped to the 6-tuple so re-sync never touches other tenants' rows
+- Server-side SQL rewriting via `sqlglot.transform` — Selects that touch `ctb_data` get the tenant filters injected into their WHERE clause (handles subqueries, CTEs, aliased table refs)
+- `POST /sync` accepts `{filter: TenantSync}` (6 IDs required)
+- `POST /query` accepts `{question, scope: TenantScope}` (4 required + 2 optional — omit finYearId for YoY)
+- `POST /upload` accepts the 6 IDs as form fields alongside the file
+- Bearer-token auth (`API_TOKEN` env var) gates every tenant-data endpoint; disabled in dev when unset
+- Streamlit UI has a top-of-page "Active engagement" form; values thread through every API call
+- 20 new tests (sqlglot injection, auth dependency, multi-tenant isolation): full suite **63/63**
+
+**v0.6 — next:**
 - Field-mapping config for the next customer whose source schema differs from the canonical 22-column shape
 - Streaming responses in the chat UI
 - "Flag wrong" feedback loop → review queue
 - Expand golden Q&As to ~30 cases (multi-FY, ratios, edge cases)
 - Confidence-scoring improvements (hybrid: model self-report + deterministic signals)
 
-**v1.0 — multi-tenant, secured, deployable at scale:**
+**v1.0 — secured at scale:**
 - S3-compatible storage adapter (S3 / R2 / MinIO)
-- API-key auth (then SSO via OIDC — Microsoft 365, Google Workspace)
-- Engagement workspaces (multi-tenant per-deployment)
+- OIDC / JWT auth (replacing the bearer token)
+- Server-side tenant-scope authorization (verify the JWT principal can access the requested scope)
 - Additional `DatabaseSource` adapters: Postgres, MySQL, SQL Server
 - Published image on a registry (so customers don't need to clone + build)
 
@@ -316,4 +376,4 @@ The runner prints a pass/fail table per case + per check, and exits non-zero if 
 
 ## Status & feedback
 
-Public preview, single-developer side project. v0.3 adds the DocumentDB sync path so customers with their TB in a Mongo-compatible DB can skip Excel entirely. Combined with v0.2's ingestion guardrails, audit trail, Excel export, and eval harness, this is enough for the first real user deployment. Docker packaging, S3 storage, and auth land in v1.0. Use with verification (the UI makes it easy). PRs and issues welcome.
+Public preview. Adopted internally at Uniqus as the first user (May 2026). v0.5 makes it multi-tenant — one deployment safely serves many CA engagements, with structural tenant isolation at storage AND query time and bearer-token auth on every protected endpoint. Combined with v0.4's Docker packaging, v0.3's DocumentDB sync, and v0.2's eval harness + Excel export, this is the version a CA firm IT admin can actually deploy and an analyst can actually use. v1.0 swaps the bearer token for OIDC/JWT and publishes the image to a registry. PRs and issues welcome.
