@@ -1,0 +1,16 @@
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+# Uniqus brand purple — primary color drives all interactive elements
+# (buttons, links, sliders, chat-input focus, etc.).
+primaryColor = "#6F42C1"
+backgroundColor = "#FFFFFF"
+# Soft violet tint for the sidebar / secondary surfaces.
+secondaryBackgroundColor = "#F7F4FC"
+textColor = "#1F2937"
+font = "sans serif"

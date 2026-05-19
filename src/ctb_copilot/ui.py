@@ -166,41 +166,39 @@ def _prefill_engagement_from_query_params() -> None:
 
 
 def render_engagement_form() -> None:
-    """Top-of-page form for the active engagement. Every downstream call
-    threads these 6 IDs plus the optional human-readable FY period label."""
-    with st.container(border=True):
-        st.subheader("Active engagement")
-        st.caption(
-            "All API calls — upload, sync, query — are scoped to this tenant tuple. "
-            "Multi-tenant deployments expect the FE to fill these from the parent portal; "
-            "for local development the defaults match the sample CTB."
-        )
-        cols = st.columns(3)
-        for i, (key, label) in enumerate(_ENGAGEMENT_FIELDS):
-            with cols[i % 3]:
-                st.text_input(
-                    label,
-                    value=st.session_state.get(f"eng-{key}", _DEFAULT_ENGAGEMENT[key]),
-                    key=f"eng-{key}",
-                )
+    """Active-engagement editor — rendered inside the sidebar as a single
+    collapsible expander. Inputs stack vertically (sidebar is narrow), no
+    bordered container — keeps the visual weight low so the chat in the
+    main area stays the hero. Expanded by default only when something's
+    missing."""
+    ok, _missing = _engagement_valid_for_sync()
+    with st.expander("🎯 Active engagement", expanded=not ok):
+        st.caption("Every API call is scoped to this tuple.")
+        for key, label in _ENGAGEMENT_FIELDS:
+            st.text_input(
+                label,
+                value=st.session_state.get(f"eng-{key}", _DEFAULT_ENGAGEMENT[key]),
+                key=f"eng-{key}",
+            )
 
         st.text_input(
-            "Financial year period (display label, e.g. 'FY 2024-25')",
+            "Financial year period (label)",
             value=st.session_state.get("eng-finYearPeriod", ""),
             key="eng-finYearPeriod",
+            placeholder="FY 2024-25",
             help=(
-                "Optional but recommended. Human-readable label saved on every "
-                "synced row. The assistant prefers this over the finYearId UUID "
-                "when filtering by year, and uses it for cross-year comparisons."
+                "Human-readable label tagged on every synced row. The assistant "
+                "filters years using this, not the UUIDs."
             ),
         )
 
         if settings.api_token is None:
             st.text_input(
-                "API token (Authorization: Bearer …) — leave blank if API is in dev mode",
+                "API token",
                 value=st.session_state.get("api_token", ""),
                 key="api_token",
                 type="password",
+                help="Authorization: Bearer …. Leave blank in dev mode.",
             )
 
 
@@ -213,8 +211,7 @@ def _engagement_fin_year_period() -> str | None:
 
 
 def render_docdb_sync() -> None:
-    """Sidebar section for DocumentDB sync. Uses the active engagement
-    as the filter automatically."""
+    """DocumentDB-sync expander, rendered inside the sidebar by the caller."""
     cfg = _api_safe("GET", "/sync/config")
     if not cfg or not cfg.get("configured"):
         return
@@ -222,80 +219,76 @@ def render_docdb_sync() -> None:
     eng = _engagement()
     ok, missing = _engagement_valid_for_sync()
 
-    with st.sidebar:
-        with st.expander("🔄 Sync from DocumentDB", expanded=False):
-            st.caption(f"Source: `{cfg['database']}.{cfg['collection']}`")
+    with st.expander("🔄 Sync from DocumentDB", expanded=False):
+        st.caption(f"Source: `{cfg['database']}.{cfg['collection']}`")
 
-            preview = dict(eng)
-            preview["status"] = "ACTIVE"  # server pins this
-            with st.expander("Filter preview", expanded=False):
-                st.code(json.dumps(preview, indent=2), language="json")
+        preview = dict(eng)
+        preview["status"] = "ACTIVE"  # server pins this
+        with st.expander("Filter preview", expanded=False):
+            st.code(json.dumps(preview, indent=2), language="json")
 
-            if not ok:
-                st.warning(f"Fill in: {', '.join(missing)} (above) before syncing.")
-            elif st.button("🚀 Sync now", key="sync-trigger", type="primary"):
+        if not ok:
+            st.warning(f"Fill in: {', '.join(missing)} (above) before syncing.")
+        elif st.button("🚀 Sync now", key="sync-trigger", type="primary"):
+            try:
+                payload: dict = {"filter": eng}
+                fyp = _engagement_fin_year_period()
+                if fyp:
+                    payload["finYearPeriod"] = fyp
+                resp = _api("POST", "/sync", json=payload)
+                st.session_state["active_sync_id"] = resp["sync_id"]
+                st.rerun()
+            except httpx.HTTPError as e:
+                detail = ""
                 try:
-                    payload: dict = {"filter": eng}
-                    fyp = _engagement_fin_year_period()
-                    if fyp:
-                        payload["finYearPeriod"] = fyp
-                    resp = _api("POST", "/sync", json=payload)
-                    st.session_state["active_sync_id"] = resp["sync_id"]
-                    st.rerun()
-                except httpx.HTTPError as e:
-                    detail = ""
-                    try:
-                        detail = e.response.json().get("detail", "") if e.response else ""
-                    except Exception:
-                        pass
-                    st.error(f"Sync request failed: {e}. {detail}")
+                    detail = e.response.json().get("detail", "") if e.response else ""
+                except Exception:
+                    pass
+                st.error(f"Sync request failed: {e}. {detail}")
 
-            active_id = st.session_state.get("active_sync_id")
-            if active_id:
-                status = _api_safe("GET", f"/sync/{active_id}")
-                if status:
-                    s = status.get("status")
-                    rows = status.get("row_count")
-                    fy = status.get("fin_year_id")
-                    if s in ("pending", "running", "reading", "inserting"):
-                        prog = f"Syncing **{fy}**"
-                        prog += f" — {rows:,} rows so far…" if rows else " — starting up…"
-                        st.info(prog)
-                        st.progress(0)
-                        time.sleep(2)
+        active_id = st.session_state.get("active_sync_id")
+        if active_id:
+            status = _api_safe("GET", f"/sync/{active_id}")
+            if status:
+                s = status.get("status")
+                rows = status.get("row_count")
+                fy = status.get("fin_year_id")
+                if s in ("pending", "running", "reading", "inserting"):
+                    prog = f"Syncing **{fy}**"
+                    prog += f" — {rows:,} rows so far…" if rows else " — starting up…"
+                    st.info(prog)
+                    st.progress(0)
+                    time.sleep(2)
+                    st.rerun()
+                elif s == "done":
+                    st.success(f"✓ Synced {rows:,} rows for {fy}")
+                    if st.button("Dismiss", key="dismiss-done"):
+                        st.session_state.pop("active_sync_id", None)
                         st.rerun()
-                    elif s == "done":
-                        st.success(f"✓ Synced {rows:,} rows for {fy}")
-                        if st.button("Dismiss", key="dismiss-done"):
-                            st.session_state.pop("active_sync_id", None)
-                            st.rerun()
-                    elif s == "failed":
-                        st.error(f"Sync failed: {status.get('error') or 'unknown error'}")
-                        if st.button("Dismiss", key="dismiss-failed"):
-                            st.session_state.pop("active_sync_id", None)
-                            st.rerun()
+                elif s == "failed":
+                    st.error(f"Sync failed: {status.get('error') or 'unknown error'}")
+                    if st.button("Dismiss", key="dismiss-failed"):
+                        st.session_state.pop("active_sync_id", None)
+                        st.rerun()
 
 
 # ---------- sidebar (loaded data) ----------
 
 
 def render_sidebar() -> None:
-    with st.sidebar:
-        st.header("📊 Loaded data")
+    """Loaded data + recent ingestions. Caller wraps in `with st.sidebar:`."""
+    with st.expander("📊 Loaded data", expanded=True):
         st.caption("Scoped to the active engagement.")
-
         periods = _api_safe("GET", "/periods") or []
         periods = [p for p in periods if _matches_active_engagement(p)]
         if not periods:
-            st.info("No data for this engagement yet. Sync from DocumentDB or upload a CTB.")
+            st.info("No data for this engagement yet. Sync or upload a CTB.")
         else:
-            st.subheader("Periods")
             for p in periods:
                 period_lbl = f"{p.get('fin_year_id')} · {p.get('reporting_period_id')}"
                 st.write(f"**{period_lbl}** — {p['row_count']:,} rows · {p['entity_count']} entities")
 
-        st.divider()
-        st.header("📜 Recent ingestions")
+    with st.expander("📜 Recent ingestions", expanded=False):
         uploads = _api_safe("GET", "/uploads") or []
         uploads = [u for u in uploads if _matches_active_engagement(u)]
         if not uploads:
@@ -310,8 +303,7 @@ def render_sidebar() -> None:
                 st.caption(f"{icon} **{fy}** · {u['filename']}{row_text}")
                 if u["status"] == "failed" and u.get("error"):
                     st.caption(f"  error: {u['error']}")
-
-        if st.button("🔄 Refresh"):
+        if st.button("🔄 Refresh", use_container_width=True):
             st.rerun()
 
 
@@ -319,47 +311,46 @@ def render_sidebar() -> None:
 
 
 def render_upload() -> None:
-    st.subheader("Upload a Consolidated Trial Balance")
-    st.caption(
-        "The file is ingested under the active engagement above. "
-        "Re-uploading for the same engagement replaces the previous data; other engagements are untouched."
-    )
-    file = st.file_uploader(
-        "CTB Excel file",
-        type=["xlsx", "xlsb", "xls"],
-        help="Single sheet, headers in row 1, 22 columns matching the expected CTB layout.",
-    )
+    """Excel upload as a collapsible sidebar section. Caller wraps with sidebar."""
+    with st.expander("📤 Upload a CTB", expanded=False):
+        st.caption(
+            "Re-uploading for the same engagement replaces previous data."
+        )
+        file = st.file_uploader(
+            "CTB Excel file",
+            type=["xlsx", "xlsb", "xls"],
+            label_visibility="collapsed",
+            help="Single sheet, headers in row 1, 22 columns matching the CTB layout.",
+        )
 
-    ok, missing = _engagement_valid_for_sync()
-    if file and not ok:
-        st.warning(f"Fill in the engagement fields above first: {', '.join(missing)}")
-    elif file and st.button("Upload & ingest", type="primary"):
-        eng = _engagement()
-        files = {"file": (file.name, file.getvalue(), file.type or "application/octet-stream")}
-        form_data = dict(eng)
-        fyp = _engagement_fin_year_period()
-        if fyp:
-            form_data["finYearPeriod"] = fyp
-        try:
-            with httpx.Client(timeout=TIMEOUT) as client:
-                r = client.post(
-                    f"{API}/upload",
-                    files=files,
-                    data=form_data,
-                    headers=_auth_headers(),
-                )
-                r.raise_for_status()
-                resp = r.json()
-            st.success(
-                f"Upload queued: `{resp['upload_id']}`. Ingestion runs in background — refresh the sidebar to see status."
-            )
-        except httpx.HTTPError as e:
-            detail = ""
+        ok, missing = _engagement_valid_for_sync()
+        if file and not ok:
+            st.warning(f"Fill in: {', '.join(missing)}")
+        elif file and st.button("Upload & ingest", type="primary", use_container_width=True):
+            eng = _engagement()
+            files = {"file": (file.name, file.getvalue(), file.type or "application/octet-stream")}
+            form_data = dict(eng)
+            fyp = _engagement_fin_year_period()
+            if fyp:
+                form_data["finYearPeriod"] = fyp
             try:
-                detail = e.response.json().get("detail", "") if e.response else ""
-            except Exception:
-                pass
-            st.error(f"Upload failed: {e}. {detail}")
+                with httpx.Client(timeout=TIMEOUT) as client:
+                    r = client.post(
+                        f"{API}/upload",
+                        files=files,
+                        data=form_data,
+                        headers=_auth_headers(),
+                    )
+                    r.raise_for_status()
+                    resp = r.json()
+                st.success(f"Upload queued: `{resp['upload_id']}`.")
+            except httpx.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.response.json().get("detail", "") if e.response else ""
+                except Exception:
+                    pass
+                st.error(f"Upload failed: {e}. {detail}")
 
 
 # ---------- chat ----------
@@ -433,12 +424,107 @@ def _build_scope_for_query() -> dict[str, str]:
     return scope
 
 
+_BRAND_CSS = """
+<style>
+/* Sidebar: tighter spacing, brand-tinted background. */
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #FBFAFE 0%, #F4EFFC 100%);
+}
+section[data-testid="stSidebar"] [data-testid="stExpander"] {
+    border: 1px solid #E5E0F2;
+    border-radius: 10px;
+    margin-bottom: 8px;
+    background: #FFFFFF;
+}
+section[data-testid="stSidebar"] [data-testid="stExpander"] summary p {
+    font-weight: 600;
+}
+
+/* Main area: brand-purple hero header. */
+.ctb-hero {
+    background: linear-gradient(135deg, #6F42C1 0%, #8B5CF6 100%);
+    color: #FFFFFF;
+    padding: 22px 28px;
+    border-radius: 14px;
+    margin-bottom: 18px;
+    box-shadow: 0 4px 16px rgba(111, 66, 193, 0.18);
+}
+.ctb-hero h1 {
+    margin: 0;
+    color: #FFFFFF !important;
+    font-size: 1.6rem;
+}
+.ctb-hero p {
+    margin: 4px 0 0 0;
+    opacity: 0.92;
+    font-size: 0.95rem;
+}
+
+/* Scope-chip row under the hero. */
+.ctb-chips {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    margin: 0 0 22px 0;
+}
+.ctb-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 12px; border-radius: 999px;
+    background: #F4EFFC; color: #4C2D91;
+    font-size: 0.85rem; font-weight: 500;
+    border: 1px solid #E5D9F7;
+}
+.ctb-chip.muted {
+    background: #F3F4F6; color: #6B7280; border-color: #E5E7EB;
+}
+
+/* Chat input: make it the visual focus. */
+[data-testid="stChatInput"] textarea {
+    font-size: 1.05rem;
+    min-height: 56px;
+    border: 1.5px solid #D8CFEF;
+}
+[data-testid="stChatInput"] textarea:focus {
+    border-color: #6F42C1;
+    box-shadow: 0 0 0 3px rgba(111, 66, 193, 0.15);
+}
+</style>
+"""
+
+
+def _inject_brand_css() -> None:
+    st.markdown(_BRAND_CSS, unsafe_allow_html=True)
+
+
+def render_active_scope_chips() -> None:
+    """Top-of-main pills summarising the active engagement at a glance.
+    Read-only — edits happen in the sidebar's `Active engagement` expander."""
+    eng = _engagement()
+    fyp = _engagement_fin_year_period()
+    chips: list[tuple[str, bool]] = []  # (text, is_set)
+    if fyp:
+        chips.append((fyp, True))
+    elif eng.get("finYearId", "").strip():
+        chips.append((f"FY · {eng['finYearId'][:8]}…", True))
+    if eng.get("reportingPeriodId", "").strip():
+        chips.append((f"Period · {eng['reportingPeriodId'][:8]}…", True))
+    if eng.get("clientId", "").strip():
+        chips.append((f"Client · {eng['clientId']}", True))
+    if eng.get("currencyId", "").strip():
+        chips.append((f"Currency · {eng['currencyId'][:8]}…", True))
+    if not chips:
+        chips.append(("No engagement set", False))
+    html = "<div class='ctb-chips'>"
+    for text, is_set in chips:
+        cls = "ctb-chip" if is_set else "ctb-chip muted"
+        html += f"<span class='{cls}'>{text}</span>"
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
 def render_chat() -> None:
     if "chat" not in st.session_state:
         st.session_state.chat = []
 
-    st.subheader("Ask a question")
-    st.caption("Answers are scoped to the active engagement. Clear FY or Reporting Period above to ask cross-period (YoY) questions.")
+    st.caption("Answers are scoped to the active engagement. Edit it in the sidebar.")
     for i, entry in enumerate(st.session_state.chat):
         render_answer(entry, index=i)
         st.divider()
@@ -468,15 +554,37 @@ def render_chat() -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="ctb-copilot", layout="wide", page_icon="📊")
-    st.title("ctb-copilot")
-    st.caption("Multi-tenant Q&A over consolidated trial balance data. Every answer shows its SQL and source rows.")
+    st.set_page_config(
+        page_title="CTB Copilot",
+        layout="wide",
+        page_icon="📊",
+        initial_sidebar_state="expanded",
+    )
     _prefill_engagement_from_query_params()
-    render_engagement_form()
-    render_docdb_sync()
-    render_sidebar()
-    render_upload()
-    st.divider()
+    _inject_brand_css()
+
+    # === Sidebar: all setup / admin / data status ===
+    with st.sidebar:
+        st.markdown("### 📊 CTB Copilot")
+        st.caption("Multi-tenant Q&A over consolidated TB")
+        st.divider()
+        render_engagement_form()
+        render_docdb_sync()
+        render_upload()
+        st.divider()
+        render_sidebar()
+
+    # === Main: hero + scope chips + chat ===
+    st.markdown(
+        """
+        <div class="ctb-hero">
+            <h1>Ask a question</h1>
+            <p>Plain-English Q&A over your consolidated trial balance. Every answer ships with the SQL and source rows.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_active_scope_chips()
     render_chat()
 
 
