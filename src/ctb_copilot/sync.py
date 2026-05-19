@@ -50,7 +50,9 @@ _STAGING_INSERT_SQL = (
 
 # Provenance + tenant columns are filled by the orchestrator; the rest
 # (the 22 canonical TB fields) come from the source DB.
-_PROVENANCE_COLUMNS = frozenset(("upload_id", "row_number", *TENANT_ID_COLUMNS))
+_PROVENANCE_COLUMNS = frozenset(
+    ("upload_id", "row_number", "fin_year_period", *TENANT_ID_COLUMNS)
+)
 _CANONICAL_DATA_FIELDS = tuple(name for name in _INSERT_COLUMNS if name not in _PROVENANCE_COLUMNS)
 
 
@@ -60,13 +62,16 @@ def _build_record(
     upload_id: str,
     row_number: int,
     tenant: TenantSync,
+    fin_year_period: str | None,
 ) -> list[Any]:
     """Convert a canonical-shape source-row dict into the record list
     that matches `_INSERT_COLUMNS` order. Tags the row with all 6 tenant
-    IDs so it lives only inside the tuple it was synced for."""
+    IDs (so it lives only inside the tuple it was synced for) plus the
+    user-supplied fin_year_period label."""
     record: list[Any] = [None] * len(_INSERT_COLUMNS)
     record[_COL_IDX["upload_id"]] = upload_id
     record[_COL_IDX["row_number"]] = row_number
+    record[_COL_IDX["fin_year_period"]] = fin_year_period
     tenant_dict = tenant.as_dict()
     for col in TENANT_ID_COLUMNS:
         record[_COL_IDX[col]] = tenant_dict[col]
@@ -99,6 +104,7 @@ def run_sync(
     filter_doc: dict[str, Any],
     tenant: TenantSync,
     db_path: Path,
+    fin_year_period: str | None = None,
 ) -> int:
     """Run a sync against the configured source. Returns the number of
     rows inserted. Raises SyncError on failure (after writing the failure
@@ -135,6 +141,7 @@ def run_sync(
                         upload_id=sync_id,
                         row_number=row_number_counter["n"],
                         tenant=tenant,
+                        fin_year_period=fin_year_period,
                     ))
                 validate_reconciliation(records)
                 conn.executemany(_STAGING_INSERT_SQL, records)

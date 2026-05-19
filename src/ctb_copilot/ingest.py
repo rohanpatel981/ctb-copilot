@@ -167,6 +167,7 @@ def _parse(path: Path) -> tuple[list[str], list[list]]:
 _INSERT_COLUMNS = [
     "upload_id", "row_number",
     *TENANT_ID_COLUMNS,  # 6 tenant ID columns (client_id, gaap_id, ...)
+    "fin_year_period",  # user-supplied human-readable FY label
     *[canonical for _, canonical in COLUMN_MAP],
 ]
 _INSERT_SQL = (
@@ -233,6 +234,7 @@ def ingest_file(
     source_path: Path,
     *,
     tenant: TenantSync,
+    fin_year_period: str | None = None,
     upload_id: str | None = None,
     original_filename: str | None = None,
 ) -> tuple[str, int]:
@@ -255,18 +257,23 @@ def ingest_file(
 
     with rw_connection(db_path) as conn:
         if pre_registered:
-            conn.execute("UPDATE ingestions SET status='reading' WHERE id=?", [upload_id])
+            conn.execute(
+                "UPDATE ingestions SET status='reading', fin_year_period=COALESCE(?, fin_year_period) WHERE id=?",
+                [fin_year_period, upload_id],
+            )
         else:
             conn.execute(
                 "INSERT INTO ingestions (id, filename, status, client_id, gaap_id, "
-                "reporting_parent_company_id, fin_year_id, reporting_period_id, currency_id) "
-                "VALUES (?, ?, 'reading', ?, ?, ?, ?, ?, ?)",
+                "reporting_parent_company_id, fin_year_id, reporting_period_id, currency_id, "
+                "fin_year_period) "
+                "VALUES (?, ?, 'reading', ?, ?, ?, ?, ?, ?, ?)",
                 [
                     upload_id, filename,
                     tenant_dict["client_id"], tenant_dict["gaap_id"],
                     tenant_dict["reporting_parent_company_id"],
                     tenant_dict["fin_year_id"], tenant_dict["reporting_period_id"],
                     tenant_dict["currency_id"],
+                    fin_year_period,
                 ],
             )
 
@@ -278,7 +285,7 @@ def ingest_file(
         prepared: list[list] = []
         for i, row in enumerate(raw_rows):
             padded = list(row) + [None] * max(0, 22 - len(row))
-            record: list = [upload_id, i + 2, *tenant_values]
+            record: list = [upload_id, i + 2, *tenant_values, fin_year_period]
             for idx, canonical in COLUMN_MAP:
                 raw = padded[idx]
                 if canonical in TEXT_COLS:
