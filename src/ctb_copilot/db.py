@@ -24,6 +24,12 @@ _CTB_DATA_COLUMNS = """
     fin_year_id                 VARCHAR NOT NULL,
     reporting_period_id         VARCHAR NOT NULL,
     currency_id                 VARCHAR NOT NULL,
+    -- Human-readable financial-year-period label supplied at sync/upload
+    -- time (e.g. 'FY 2024-25', 'FY 2025-26 Q1'). Distinct from the UUID
+    -- fin_year_id/reporting_period_id; this is what the LLM uses for
+    -- cross-period queries (YoY, multi-year comparison) because UUIDs
+    -- pin a single combo while the label can match multiple syncs.
+    fin_year_period             VARCHAR,
     -- CTB row content
     consol_gl_code              VARCHAR,
     consol_gl_description       VARCHAR,
@@ -58,6 +64,7 @@ CREATE TABLE IF NOT EXISTS ctb_data ({_CTB_DATA_COLUMNS});
 CREATE INDEX IF NOT EXISTS idx_ctb_tenant
     ON ctb_data(client_id, gaap_id, reporting_parent_company_id, currency_id);
 CREATE INDEX IF NOT EXISTS idx_ctb_fin_year_id ON ctb_data(fin_year_id);
+CREATE INDEX IF NOT EXISTS idx_ctb_fin_year_period ON ctb_data(fin_year_period);
 CREATE INDEX IF NOT EXISTS idx_ctb_fs_category ON ctb_data(fs_category);
 CREATE INDEX IF NOT EXISTS idx_ctb_entity_code ON ctb_data(entity_code);
 
@@ -83,6 +90,7 @@ CREATE TABLE IF NOT EXISTS ingestions (
     fin_year_id                 VARCHAR,
     reporting_period_id         VARCHAR,
     currency_id                 VARCHAR,
+    fin_year_period             VARCHAR,
     source_metadata             JSON
 );
 """
@@ -103,6 +111,11 @@ _MIGRATIONS = (
     "ALTER TABLE ingestions ADD COLUMN IF NOT EXISTS fin_year_id VARCHAR",
     "ALTER TABLE ingestions ADD COLUMN IF NOT EXISTS reporting_period_id VARCHAR",
     "ALTER TABLE ingestions ADD COLUMN IF NOT EXISTS currency_id VARCHAR",
+    # v0.5 → v0.6: add fin_year_period (human-readable FY label) to all
+    # data tables. Idempotent on fresh DBs and existing DBs alike.
+    "ALTER TABLE ctb_data ADD COLUMN IF NOT EXISTS fin_year_period VARCHAR",
+    "ALTER TABLE ctb_data_staging ADD COLUMN IF NOT EXISTS fin_year_period VARCHAR",
+    "ALTER TABLE ingestions ADD COLUMN IF NOT EXISTS fin_year_period VARCHAR",
     # The v0.4 `period` column is gone (replaced by fin_year_id). Drop it
     # from old databases if present. DuckDB raises if the column doesn't
     # exist; init_db catches that below.

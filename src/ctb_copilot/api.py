@@ -14,7 +14,7 @@ from typing import Any
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ctb_copilot.adapters.llm_anthropic import AnthropicLLM
 from ctb_copilot.adapters.source_docdb import DocumentDBSource
@@ -78,6 +78,7 @@ class IngestionStatus(BaseModel):
     fin_year_id: str | None = None
     reporting_period_id: str | None = None
     currency_id: str | None = None
+    fin_year_period: str | None = None
 
 
 class QueryRequest(BaseModel):
@@ -87,8 +88,16 @@ class QueryRequest(BaseModel):
 
 class SyncRequest(BaseModel):
     """FE sends camelCase keys inside `filter`. status='ACTIVE' is pinned
-    server-side; FE doesn't need to send it."""
+    server-side; FE doesn't need to send it.
+
+    `fin_year_period` is the optional human-readable FY label (e.g.
+    'FY 2024-25') the user supplies in the UI. Every synced row is tagged
+    with this value so cross-period queries can filter on it (instead of
+    UUIDs that would pin a single year/period combo)."""
+    model_config = ConfigDict(populate_by_name=True)
+
     filter: TenantSync
+    fin_year_period: str | None = Field(default=None, alias="finYearPeriod")
 
 
 class SyncResponse(BaseModel):
@@ -103,7 +112,14 @@ class DocDBConfigResponse(BaseModel):
     collection: str | None = None
 
 
-def _run_ingestion_bg(db_path: Path, source_path: Path, upload_id: str, tenant: TenantSync, original_filename: str) -> None:
+def _run_ingestion_bg(
+    db_path: Path,
+    source_path: Path,
+    upload_id: str,
+    tenant: TenantSync,
+    original_filename: str,
+    fin_year_period: str | None = None,
+) -> None:
     """Background task wrapper that swallows exceptions. ingest_file already
     persists failures to the ingestions table; we don't want the background
     task crash to take down the worker."""
@@ -112,6 +128,7 @@ def _run_ingestion_bg(db_path: Path, source_path: Path, upload_id: str, tenant: 
             db_path=db_path,
             source_path=source_path,
             tenant=tenant,
+            fin_year_period=fin_year_period,
             upload_id=upload_id,
             original_filename=original_filename,
         )
@@ -136,6 +153,7 @@ async def upload(
     finYearId: str = Form(...),
     reportingPeriodId: str = Form(...),
     currencyId: str = Form(...),
+    finYearPeriod: str | None = Form(default=None),
 ) -> UploadResponse:
     if not file.filename or not file.filename.lower().endswith((".xlsx", ".xlsb", ".xls")):
         raise HTTPException(400, "Upload must be an Excel file (.xlsx / .xlsb / .xls).")
@@ -173,9 +191,9 @@ async def upload(
         conn.execute(
             "INSERT INTO ingestions (id, filename, status, source_type, "
             "client_id, gaap_id, reporting_parent_company_id, fin_year_id, "
-            "reporting_period_id, currency_id) "
-            "VALUES (?, ?, 'pending', 'excel', ?, ?, ?, ?, ?, ?)",
-            [upload_id, file.filename, *where_args],
+            "reporting_period_id, currency_id, fin_year_period) "
+            "VALUES (?, ?, 'pending', 'excel', ?, ?, ?, ?, ?, ?, ?)",
+            [upload_id, file.filename, *where_args, finYearPeriod],
         )
 
     background_tasks.add_task(
@@ -185,6 +203,7 @@ async def upload(
         upload_id,
         tenant,
         file.filename,
+        finYearPeriod,
     )
     return UploadResponse(upload_id=upload_id, status="pending")
 
@@ -192,7 +211,8 @@ async def upload(
 _INGESTIONS_SELECT = (
     "SELECT id, filename, status, row_count, error, "
     "client_id, gaap_id, reporting_parent_company_id, "
-    "fin_year_id, reporting_period_id, currency_id FROM ingestions"
+    "fin_year_id, reporting_period_id, currency_id, fin_year_period "
+    "FROM ingestions"
 )
 
 
@@ -201,6 +221,7 @@ def _row_to_status(r: tuple) -> IngestionStatus:
         id=r[0], filename=r[1], status=r[2], row_count=r[3], error=r[4],
         client_id=r[5], gaap_id=r[6], reporting_parent_company_id=r[7],
         fin_year_id=r[8], reporting_period_id=r[9], currency_id=r[10],
+        fin_year_period=r[11],
     )
 
 
@@ -304,7 +325,12 @@ def _build_docdb_filter(tenant: TenantSync) -> dict[str, Any]:
     }
 
 
-def _run_sync_bg(sync_id: str, tenant: TenantSync, filter_doc: dict) -> None:
+def _run_sync_bg(
+    sync_id: str,
+    tenant: TenantSync,
+    filter_doc: dict,
+    fin_year_period: str | None = None,
+) -> None:
     """BackgroundTask wrapper. Swallows SyncError because run_sync has
     already written the failure to the ingestions table."""
     source = DocumentDBSource(
@@ -320,6 +346,7 @@ def _run_sync_bg(sync_id: str, tenant: TenantSync, filter_doc: dict) -> None:
             filter_doc=filter_doc,
             tenant=tenant,
             db_path=settings.duckdb_path,
+            fin_year_period=fin_year_period,
         )
     except SyncError:
         pass
@@ -349,17 +376,20 @@ def sync_from_docdb(req: SyncRequest, background_tasks: BackgroundTasks) -> Sync
         conn.execute(
             "INSERT INTO ingestions (id, filename, status, source_type, source_metadata, "
             "client_id, gaap_id, reporting_parent_company_id, fin_year_id, "
-            "reporting_period_id, currency_id) "
-            "VALUES (?, ?, 'pending', 'docdb', ?, ?, ?, ?, ?, ?, ?)",
+            "reporting_period_id, currency_id, fin_year_period) "
+            "VALUES (?, ?, 'pending', 'docdb', ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 sync_id, f"<docdb:{settings.docdb_collection}>",
                 json.dumps(source_metadata),
                 td["client_id"], td["gaap_id"], td["reporting_parent_company_id"],
                 td["fin_year_id"], td["reporting_period_id"], td["currency_id"],
+                req.fin_year_period,
             ],
         )
 
-    background_tasks.add_task(_run_sync_bg, sync_id, tenant, filter_doc)
+    background_tasks.add_task(
+        _run_sync_bg, sync_id, tenant, filter_doc, req.fin_year_period
+    )
 
     return SyncResponse(sync_id=sync_id, status="pending", filter_applied=filter_doc)
 

@@ -21,16 +21,18 @@ _SYSTEM_TEMPLATE = """You are a SQL query assistant for a consolidated trial bal
 
 The table has 6 tenant-identity columns: `client_id`, `gaap_id`, `reporting_parent_company_id`, `fin_year_id`, `reporting_period_id`, `currency_id`. **The server automatically adds WHERE clauses for the active tenant scope** (4 of these 6, always; the other 2 sometimes). You do NOT need to filter on them — your SQL will be rewritten to include the tenant filters before execution.
 
-Two exceptions where you SHOULD filter explicitly:
-- When the user asks about a specific financial year and `fin_year_id` is NOT pinned by the scope — e.g. "YoY change in revenue from FY 2024-25 to FY 2025-26" → use `WHERE fin_year_id IN ('FY 2024-25', 'FY 2025-26')`.
-- When the user asks about a specific reporting period (Annual vs Q4 etc.) and `reporting_period_id` is NOT pinned — filter on it explicitly.
+When filtering by financial year, ALWAYS use the `fin_year_period` column (a human-readable label like 'FY 2024-25' supplied by the user at sync/upload time). Do NOT filter on `fin_year_id` or `reporting_period_id` — those are UUIDs that pin a single (year, period) combo and break cross-year queries.
 
-For aggregates, prefer including `fin_year_id` in the SELECT for clarity (so the analyst sees which year the answer covers).
+- Single-year question ("Total liabilities for FY 2024-25") → `WHERE fin_year_period = 'FY 2024-25'`
+- Cross-year comparison ("YoY", "FY 24-25 vs FY 25-26") → `WHERE fin_year_period IN ('FY 2024-25', 'FY 2025-26')`, GROUP BY `fin_year_period`
+- If the user doesn't name a year, omit the filter entirely — the server's tenant scope handles it
+
+For aggregates, include `fin_year_period` in the SELECT so the analyst sees which year the answer covers.
 
 # Column meanings
 
-- `fin_year_id`: user-supplied FY label (e.g. 'FY 2024-25'). Use for time filtering when the user asks about a specific year. There is NO date column.
-- `reporting_period_id`: intra-year cadence — 'Annual', 'Q1', 'Q2', 'Q3', 'Q4'. Use when the user asks about a specific quarter or annual view.
+- `fin_year_period`: **human-readable FY label** (e.g. 'FY 2024-25', 'FY 2025-26 Q1'). User-supplied at sync/upload time. **Use this for time filtering** — single-period AND cross-period queries. There is NO date column.
+- `fin_year_id`, `reporting_period_id`: **UUIDs** of a single specific (year, period). The server pins these via the tenant scope when relevant. Do NOT filter on them yourself.
 - `fs_category`: known values are 'Assets', 'Liabilities', 'Equity', 'Revenue', 'Expense', 'Other Comprehensive', 'Tax expense'. Case-sensitive — use exact strings. 'Tax expense' and 'Other Comprehensive' are P&L-side categories that sit alongside 'Revenue' and 'Expense'; do not exclude them silently.
 - `gl_nature`: 'Balance Sheet' or 'Statement of PL'. Useful to separate BS from P&L.
 - `bs_classification`: e.g. 'Current liabilities', 'Non-current assets'.
@@ -88,10 +90,10 @@ Use `amount_reporting_ccy` if and only if:
 
 # How to handle common question shapes
 
-1. **Period filtering**: only filter on `fin_year_id` if the scope leaves it open (cross-period questions like YoY). For single-period questions, the scope's `fin_year_id` is auto-injected — don't duplicate. If the user names multiple years, use `WHERE fin_year_id IN ('FY 2024-25', 'FY 2025-26')`.
+1. **Period filtering**: use `fin_year_period` (the human-readable label) — never `fin_year_id` or `reporting_period_id`. If the user names one year, use `WHERE fin_year_period = 'FY 2024-25'`. If multiple, use `IN (...)`.
 2. **Entity filtering**: use `entity_code` or `entity_name`. State which entities you included in the explanation.
 3. **High-level totals**: `SUM(amount_consolidated)` grouped by `fs_category` or `bs_classification`.
-4. **Year-over-year (YoY)**: `SELECT fin_year_id, SUM(amount_consolidated) FROM ctb_data WHERE fs_category = 'X' GROUP BY fin_year_id ORDER BY fin_year_id`. Then set `post_process` = "yoy_pct" so the wrapper computes percentage change between consecutive periods.
+4. **Year-over-year (YoY)**: `SELECT fin_year_period, SUM(amount_consolidated) FROM ctb_data WHERE fs_category = 'X' GROUP BY fin_year_period ORDER BY fin_year_period`. Then set `post_process` = "yoy_pct".
 5. **Ratios**: select numerator and denominator side-by-side in one row per period. Set `post_process` = "ratio".
 
 # Rules
@@ -115,10 +117,10 @@ Use `amount_reporting_ccy` if and only if:
 Q: "What's the total current liabilities for FY 2024-25?"
 SQL:
 ```sql
-SELECT fin_year_id, bs_classification, SUM(amount_consolidated) AS total
+SELECT fin_year_period, bs_classification, SUM(amount_consolidated) AS total
 FROM ctb_data
-WHERE fin_year_id = 'FY 2024-25' AND bs_classification = 'Current liabilities'
-GROUP BY fin_year_id, bs_classification;
+WHERE fin_year_period = 'FY 2024-25' AND bs_classification = 'Current liabilities'
+GROUP BY fin_year_period, bs_classification;
 ```
 Explanation: Sums the consolidated amount across all current-liability rows for FY 2024-25. Liabilities are shown negative per trial-balance convention. Rolled up across all entities.
 post_process: none
@@ -127,11 +129,11 @@ confidence: high
 Q: "YoY change in revenue from FY 2024-25 to FY 2025-26?"
 SQL:
 ```sql
-SELECT fin_year_id, SUM(amount_consolidated) AS total_revenue
+SELECT fin_year_period, SUM(amount_consolidated) AS total_revenue
 FROM ctb_data
-WHERE fs_category = 'Revenue' AND period IN ('FY 2024-25', 'FY 2025-26')
-GROUP BY fin_year_id
-ORDER BY fin_year_id;
+WHERE fs_category = 'Revenue' AND fin_year_period IN ('FY 2024-25', 'FY 2025-26')
+GROUP BY fin_year_period
+ORDER BY fin_year_period;
 ```
 Explanation: Totals revenue per period (negative per TB convention; absolute magnitude grows when revenue grows). post_process will compute the YoY % change between consecutive rows.
 post_process: yoy_pct
@@ -140,11 +142,11 @@ confidence: high
 Q: "What's the cash position for GCC7?"
 SQL:
 ```sql
-SELECT fin_year_id, entity_code, fsli, SUM(amount_functional_ccy) AS amount_fc, functional_currency
+SELECT fin_year_period, entity_code, fsli, SUM(amount_functional_ccy) AS amount_fc, functional_currency
 FROM ctb_data
 WHERE entity_code = 'GCC7' AND fsli ILIKE '%cash%'
-GROUP BY fin_year_id, entity_code, fsli, functional_currency
-ORDER BY fin_year_id;
+GROUP BY fin_year_period, entity_code, fsli, functional_currency
+ORDER BY fin_year_period;
 ```
 Explanation: Filters to GCC7 and FSLI rows matching 'cash'. Uses functional-currency amount since the user asked about one entity. State the functional currency in the answer.
 post_process: none

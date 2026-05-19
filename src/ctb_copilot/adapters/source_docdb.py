@@ -137,9 +137,64 @@ def _project_consolidation_final_tb(doc: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _project_console_append_tb(doc: dict[str, Any]) -> dict[str, Any]:
+    """Map a Uniqus `ConsoleAppendTB` Mongo document to the canonical
+    22-column shape.
+
+    Source shape (Java/Spring `com.uniqus.core.models.mongo.ConsoleAppendTB`):
+      - consoleGlCode, consoleGlDesc, entityCode, entityName, entityGlCode
+      - fsType ("Balance Sheet" / "Statement of P&L")
+      - fsCategory, fsSubCategory, fsli, groupings, subGroupings
+      - amountInFunctionalCurrency   → {currency, value, …}
+      - amountInLocalCurrency        → {currency, value, …}
+      - otherAdjustmentAmount, nciAmount, goodWillAmount, ppaAmount,
+        iceAmount, iceShareCapitalAmount, retainedEarningsAmount,
+        fctrAmount                    → each {value, …}
+      - totalBalance                  → running consolidated total
+
+    AppendTB is the row-level pivot: every adjustment module ($inc-s) into
+    one of the *Amount fields, and totalBalance is kept in sync as
+        totalBalance == amountInLocalCurrency.value + Σ(all adj_*).
+    So the canonical reconciliation invariant holds by construction.
+    """
+
+    def _val(field: str) -> float | None:
+        sub = doc.get(field)
+        if isinstance(sub, dict):
+            return sub.get("value")
+        return None
+
+    func = doc.get("amountInFunctionalCurrency") or {}
+    return {
+        "consol_gl_code": doc.get("consoleGlCode"),
+        "consol_gl_description": doc.get("consoleGlDesc"),
+        "entity_name": doc.get("entityName"),
+        "entity_code": doc.get("entityCode"),
+        "gl_nature": doc.get("fsType"),
+        "fs_category": doc.get("fsCategory"),
+        "bs_classification": doc.get("fsSubCategory"),
+        "fsli": doc.get("fsli"),
+        "grouping": doc.get("groupings"),
+        "sub_grouping": doc.get("subGroupings"),
+        "functional_currency": func.get("currency") if isinstance(func, dict) else None,
+        "amount_functional_ccy": func.get("value") if isinstance(func, dict) else None,
+        "amount_reporting_ccy": _val("amountInLocalCurrency"),
+        "adj_other_consolidated": _val("otherAdjustmentAmount"),
+        "adj_nci": _val("nciAmount"),
+        "adj_goodwill": _val("goodWillAmount"),
+        "adj_ppa": _val("ppaAmount"),
+        "adj_intercompany": _val("iceAmount"),
+        "adj_investment_capital": _val("iceShareCapitalAmount"),
+        "adj_retained_earnings": _val("retainedEarningsAmount"),
+        "adj_fctr": _val("fctrAmount"),
+        "amount_consolidated": doc.get("totalBalance"),
+    }
+
+
 _PROJECTORS = {
     "canonical": _project_doc,
     "consolidation_final_tb": _project_consolidation_final_tb,
+    "console_append_tb": _project_console_append_tb,
 }
 
 

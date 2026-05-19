@@ -141,6 +141,7 @@ _URL_PARAM_TO_SESSION_KEY: dict[str, str] = {
     "periodId": "eng-reportingPeriodId",
     "reportingPeriodId": "eng-reportingPeriodId",
     "currencyId": "eng-currencyId",
+    "finYearPeriod": "eng-finYearPeriod",
 }
 
 
@@ -166,7 +167,7 @@ def _prefill_engagement_from_query_params() -> None:
 
 def render_engagement_form() -> None:
     """Top-of-page form for the active engagement. Every downstream call
-    threads these 6 IDs."""
+    threads these 6 IDs plus the optional human-readable FY period label."""
     with st.container(border=True):
         st.subheader("Active engagement")
         st.caption(
@@ -183,6 +184,17 @@ def render_engagement_form() -> None:
                     key=f"eng-{key}",
                 )
 
+        st.text_input(
+            "Financial year period (display label, e.g. 'FY 2024-25')",
+            value=st.session_state.get("eng-finYearPeriod", ""),
+            key="eng-finYearPeriod",
+            help=(
+                "Optional but recommended. Human-readable label saved on every "
+                "synced row. The assistant prefers this over the finYearId UUID "
+                "when filtering by year, and uses it for cross-year comparisons."
+            ),
+        )
+
         if settings.api_token is None:
             st.text_input(
                 "API token (Authorization: Bearer …) — leave blank if API is in dev mode",
@@ -190,6 +202,11 @@ def render_engagement_form() -> None:
                 key="api_token",
                 type="password",
             )
+
+
+def _engagement_fin_year_period() -> str | None:
+    val = st.session_state.get("eng-finYearPeriod") or ""
+    return val.strip() or None
 
 
 # ---------- sync (DocumentDB) ----------
@@ -218,7 +235,11 @@ def render_docdb_sync() -> None:
                 st.warning(f"Fill in: {', '.join(missing)} (above) before syncing.")
             elif st.button("🚀 Sync now", key="sync-trigger", type="primary"):
                 try:
-                    resp = _api("POST", "/sync", json={"filter": eng})
+                    payload: dict = {"filter": eng}
+                    fyp = _engagement_fin_year_period()
+                    if fyp:
+                        payload["finYearPeriod"] = fyp
+                    resp = _api("POST", "/sync", json=payload)
                     st.session_state["active_sync_id"] = resp["sync_id"]
                     st.rerun()
                 except httpx.HTTPError as e:
@@ -315,12 +336,16 @@ def render_upload() -> None:
     elif file and st.button("Upload & ingest", type="primary"):
         eng = _engagement()
         files = {"file": (file.name, file.getvalue(), file.type or "application/octet-stream")}
+        form_data = dict(eng)
+        fyp = _engagement_fin_year_period()
+        if fyp:
+            form_data["finYearPeriod"] = fyp
         try:
             with httpx.Client(timeout=TIMEOUT) as client:
                 r = client.post(
                     f"{API}/upload",
                     files=files,
-                    data=eng,
+                    data=form_data,
                     headers=_auth_headers(),
                 )
                 r.raise_for_status()
