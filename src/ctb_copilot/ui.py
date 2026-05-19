@@ -1,16 +1,23 @@
-"""Streamlit UI for ctb-copilot. Talks to FastAPI over HTTP.
+"""Streamlit UI for ctb-copilot.
 
-v1 layout: sidebar shows ingested periods + entities; main area has an upload
-section and a chat. Every answer includes the SQL it ran and the source rows
-it used so a CA can verify before pasting into working papers.
+v0.5 layout: the UI is tenant-aware. The user fills in the 6-tuple
+engagement identity (client_id, gaap_id, reporting_parent_company_id,
+fin_year_id, reporting_period_id, currency_id) at the top of the page;
+every API call threads those values through. The optional bearer token
+is sent on every request when configured.
+
+The sidebar shows only the loaded periods that match the active
+engagement's tenant scope so multi-tenant deployments don't leak
+other tenants' data through the UI.
 """
 
-import subprocess
-import sys
-from pathlib import Path
+from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import httpx
 import streamlit as st
@@ -21,13 +28,43 @@ from ctb_copilot.export import export_filename, query_result_to_xlsx
 API = settings.api_base_url
 TIMEOUT = httpx.Timeout(120.0)
 
-FY_OPTIONS: list[str] = [f"FY {y}-{(y + 1) % 100:02d}" for y in range(2005, 2050)]
-DEFAULT_FY = "FY 2024-25"
+# Defaults shown in the engagement form. These exist so a developer can
+# `uv run ctb-ui` against the sample data with no friction; real users
+# of multi-tenant deployments will fill these in from their portal.
+_DEFAULT_ENGAGEMENT: dict[str, str] = {
+    "clientId": "demo-client",
+    "gaapId": "ind_as",
+    "reportingParentCompanyId": "demo-rpc",
+    "currencyId": "INR",
+    "finYearId": "FY 2024-25",
+    "reportingPeriodId": "Annual",
+}
+
+_ENGAGEMENT_FIELDS = (
+    ("clientId", "Client ID"),
+    ("gaapId", "GAAP ID"),
+    ("reportingParentCompanyId", "Reporting Parent Company ID"),
+    ("currencyId", "Currency"),
+    ("finYearId", "FY (FinYear ID)"),
+    ("reportingPeriodId", "Reporting period"),
+)
 
 
-def _api(method: str, path: str, **kwargs) -> dict | list:
+# ---------- helpers ----------
+
+
+def _auth_headers() -> dict[str, str]:
+    """Build the Authorization header from session-state token (UI-supplied)
+    or from settings (env-configured). UI-supplied wins."""
+    token = st.session_state.get("api_token") or settings.api_token
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _api(method: str, path: str, **kwargs):
+    headers = kwargs.pop("headers", {}) or {}
+    headers.update(_auth_headers())
     with httpx.Client(timeout=TIMEOUT) as client:
-        r = client.request(method, f"{API}{path}", **kwargs)
+        r = client.request(method, f"{API}{path}", headers=headers, **kwargs)
         r.raise_for_status()
         return r.json()
 
@@ -36,8 +73,48 @@ def _api_safe(method: str, path: str, **kwargs):
     try:
         return _api(method, path, **kwargs)
     except httpx.HTTPError as e:
+        # Don't spam the UI on 401s when the user hasn't entered a token yet
+        if e.response is not None and e.response.status_code == 401:
+            return None
         st.error(f"API error: {e}")
         return None
+
+
+def _engagement() -> dict[str, str]:
+    """Read the active engagement out of session state, filling missing
+    fields with defaults so partial setup doesn't crash the page."""
+    return {k: st.session_state.get(f"eng-{k}", _DEFAULT_ENGAGEMENT[k]) for k, _ in _ENGAGEMENT_FIELDS}
+
+
+def _required_scope_keys() -> list[str]:
+    return ["clientId", "gaapId", "reportingParentCompanyId", "currencyId"]
+
+
+def _engagement_valid_for_sync() -> tuple[bool, list[str]]:
+    eng = _engagement()
+    missing = [k for k, _ in _ENGAGEMENT_FIELDS if not eng.get(k, "").strip()]
+    return (len(missing) == 0, missing)
+
+
+def _engagement_valid_for_query() -> tuple[bool, list[str]]:
+    eng = _engagement()
+    missing = [k for k in _required_scope_keys() if not eng.get(k, "").strip()]
+    return (len(missing) == 0, missing)
+
+
+def _matches_active_engagement(row: dict) -> bool:
+    eng = _engagement()
+    for k in _required_scope_keys():
+        # Map camelCase eng → snake_case API field
+        api_key = {
+            "clientId": "client_id",
+            "gaapId": "gaap_id",
+            "reportingParentCompanyId": "reporting_parent_company_id",
+            "currencyId": "currency_id",
+        }[k]
+        if (row.get(api_key) or "") != eng.get(k, ""):
+            return False
+    return True
 
 
 def _fmt_number(val) -> str:
@@ -52,41 +129,65 @@ def _confidence_badge(conf: str) -> str:
     return {"high": "🟢 High", "medium": "🟡 Medium", "low": "🔴 Low"}.get(conf, conf)
 
 
+# ---------- engagement form ----------
+
+
+def render_engagement_form() -> None:
+    """Top-of-page form for the active engagement. Every downstream call
+    threads these 6 IDs."""
+    with st.container(border=True):
+        st.subheader("Active engagement")
+        st.caption(
+            "All API calls — upload, sync, query — are scoped to this tenant tuple. "
+            "Multi-tenant deployments expect the FE to fill these from the parent portal; "
+            "for local development the defaults match the sample CTB."
+        )
+        cols = st.columns(3)
+        for i, (key, label) in enumerate(_ENGAGEMENT_FIELDS):
+            with cols[i % 3]:
+                st.text_input(
+                    label,
+                    value=st.session_state.get(f"eng-{key}", _DEFAULT_ENGAGEMENT[key]),
+                    key=f"eng-{key}",
+                )
+
+        if settings.api_token is None:
+            st.text_input(
+                "API token (Authorization: Bearer …) — leave blank if API is in dev mode",
+                value=st.session_state.get("api_token", ""),
+                key="api_token",
+                type="password",
+            )
+
+
+# ---------- sync (DocumentDB) ----------
+
+
 def render_docdb_sync() -> None:
-    """Sidebar section for DocumentDB sync. Hidden if not configured in .env."""
+    """Sidebar section for DocumentDB sync. Uses the active engagement
+    as the filter automatically."""
     cfg = _api_safe("GET", "/sync/config")
     if not cfg or not cfg.get("configured"):
         return
+
+    eng = _engagement()
+    ok, missing = _engagement_valid_for_sync()
 
     with st.sidebar:
         with st.expander("🔄 Sync from DocumentDB", expanded=False):
             st.caption(f"Source: `{cfg['database']}.{cfg['collection']}`")
 
-            period = st.selectbox(
-                "Period to sync",
-                options=FY_OPTIONS,
-                index=FY_OPTIONS.index(DEFAULT_FY),
-                key="sync-period",
-                help="Will be sent as the value of the configured period field.",
-            )
-
-            filter_preview = dict(cfg.get("default_filter") or {})
-            if cfg.get("period_field"):
-                filter_preview[cfg["period_field"]] = period
-            if cfg.get("reporting_period") and cfg.get("reporting_period_field"):
-                filter_preview[cfg["reporting_period_field"]] = cfg["reporting_period"]
-
+            preview = dict(eng)
+            preview["status"] = "ACTIVE"  # server pins this
             with st.expander("Filter preview", expanded=False):
-                st.code(json.dumps(filter_preview, indent=2), language="json")
+                st.code(json.dumps(preview, indent=2), language="json")
 
-            if st.button("🚀 Sync now", key="sync-trigger", type="primary"):
+            if not ok:
+                st.warning(f"Fill in: {', '.join(missing)} (above) before syncing.")
+            elif st.button("🚀 Sync now", key="sync-trigger", type="primary"):
                 try:
-                    with httpx.Client(timeout=TIMEOUT) as client:
-                        r = client.post(f"{API}/sync", json={"period": period, "filter_override": {}})
-                        r.raise_for_status()
-                        resp = r.json()
+                    resp = _api("POST", "/sync", json={"filter": eng})
                     st.session_state["active_sync_id"] = resp["sync_id"]
-                    st.session_state["active_sync_period"] = period
                     st.rerun()
                 except httpx.HTTPError as e:
                     detail = ""
@@ -102,19 +203,16 @@ def render_docdb_sync() -> None:
                 if status:
                     s = status.get("status")
                     rows = status.get("row_count")
-                    period_lbl = status.get("period")
-                    if s in ("pending", "running"):
-                        prog_text = f"Syncing **{period_lbl}**"
-                        if rows:
-                            prog_text += f" — {rows:,} rows so far…"
-                        else:
-                            prog_text += " — starting up…"
-                        st.info(prog_text)
-                        st.progress(0)  # indeterminate; actual % needs a known total
+                    fy = status.get("fin_year_id")
+                    if s in ("pending", "running", "reading", "inserting"):
+                        prog = f"Syncing **{fy}**"
+                        prog += f" — {rows:,} rows so far…" if rows else " — starting up…"
+                        st.info(prog)
+                        st.progress(0)
                         time.sleep(2)
                         st.rerun()
                     elif s == "done":
-                        st.success(f"✓ Synced {rows:,} rows for {period_lbl}")
+                        st.success(f"✓ Synced {rows:,} rows for {fy}")
                         if st.button("Dismiss", key="dismiss-done"):
                             st.session_state.pop("active_sync_id", None)
                             st.rerun()
@@ -125,34 +223,38 @@ def render_docdb_sync() -> None:
                             st.rerun()
 
 
+# ---------- sidebar (loaded data) ----------
+
+
 def render_sidebar() -> None:
     with st.sidebar:
         st.header("📊 Loaded data")
+        st.caption("Scoped to the active engagement.")
 
         periods = _api_safe("GET", "/periods") or []
+        periods = [p for p in periods if _matches_active_engagement(p)]
         if not periods:
-            st.info("No periods ingested yet. Upload a CTB to get started.")
+            st.info("No data for this engagement yet. Sync from DocumentDB or upload a CTB.")
         else:
             st.subheader("Periods")
             for p in periods:
-                st.write(f"**{p['period']}** — {p['row_count']:,} rows · {p['entity_count']} entities")
-
-        entities = _api_safe("GET", "/entities") or []
-        if entities:
-            st.subheader(f"Entities ({len(entities)})")
-            for e in entities:
-                st.caption(f"`{e['entity_code']}` — {e['entity_name']}")
+                period_lbl = f"{p.get('fin_year_id')} · {p.get('reporting_period_id')}"
+                st.write(f"**{period_lbl}** — {p['row_count']:,} rows · {p['entity_count']} entities")
 
         st.divider()
-        st.header("📜 Recent uploads")
+        st.header("📜 Recent ingestions")
         uploads = _api_safe("GET", "/uploads") or []
+        uploads = [u for u in uploads if _matches_active_engagement(u)]
         if not uploads:
-            st.caption("No uploads yet.")
+            st.caption("No ingestions yet for this engagement.")
         else:
             for u in uploads[:10]:
-                icon = {"done": "✓", "failed": "✗", "pending": "⏳", "reading": "⏳", "inserting": "⏳"}.get(u["status"], "•")
+                icon = {"done": "✓", "failed": "✗", "pending": "⏳",
+                        "reading": "⏳", "inserting": "⏳", "running": "⏳",
+                        "replaced": "↩"}.get(u["status"], "•")
                 row_text = f" — {u['row_count']:,} rows" if u["row_count"] else ""
-                st.caption(f"{icon} **{u['period']}** · {u['filename']}{row_text}")
+                fy = u.get("fin_year_id") or "?"
+                st.caption(f"{icon} **{fy}** · {u['filename']}{row_text}")
                 if u["status"] == "failed" and u.get("error"):
                     st.caption(f"  error: {u['error']}")
 
@@ -160,37 +262,40 @@ def render_sidebar() -> None:
             st.rerun()
 
 
+# ---------- Excel upload ----------
+
+
 def render_upload() -> None:
     st.subheader("Upload a Consolidated Trial Balance")
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        file = st.file_uploader(
-            "CTB Excel file",
-            type=["xlsx", "xlsb", "xls"],
-            help="Single sheet, headers in row 1, 22 columns matching the expected CTB layout.",
-            label_visibility="collapsed",
-        )
-    with col2:
-        period = st.selectbox(
-            "FY period tag",
-            options=FY_OPTIONS,
-            index=FY_OPTIONS.index(DEFAULT_FY),
-            help=(
-                "The financial year this CTB represents. "
-                "Uploading a file with an FY tag that already exists will REPLACE the previous data for that period."
-            ),
-            label_visibility="collapsed",
-        )
+    st.caption(
+        "The file is ingested under the active engagement above. "
+        "Re-uploading for the same engagement replaces the previous data; other engagements are untouched."
+    )
+    file = st.file_uploader(
+        "CTB Excel file",
+        type=["xlsx", "xlsb", "xls"],
+        help="Single sheet, headers in row 1, 22 columns matching the expected CTB layout.",
+    )
 
-    if file and period and st.button("Upload & ingest", type="primary"):
+    ok, missing = _engagement_valid_for_sync()
+    if file and not ok:
+        st.warning(f"Fill in the engagement fields above first: {', '.join(missing)}")
+    elif file and st.button("Upload & ingest", type="primary"):
+        eng = _engagement()
         files = {"file": (file.name, file.getvalue(), file.type or "application/octet-stream")}
-        data = {"period": period}
         try:
             with httpx.Client(timeout=TIMEOUT) as client:
-                r = client.post(f"{API}/upload", files=files, data=data)
+                r = client.post(
+                    f"{API}/upload",
+                    files=files,
+                    data=eng,
+                    headers=_auth_headers(),
+                )
                 r.raise_for_status()
                 resp = r.json()
-            st.success(f"Upload queued: `{resp['upload_id']}`. Ingestion runs in background — refresh the sidebar to see status.")
+            st.success(
+                f"Upload queued: `{resp['upload_id']}`. Ingestion runs in background — refresh the sidebar to see status."
+            )
         except httpx.HTTPError as e:
             detail = ""
             try:
@@ -200,15 +305,15 @@ def render_upload() -> None:
             st.error(f"Upload failed: {e}. {detail}")
 
 
+# ---------- chat ----------
+
+
 def render_answer(result: dict, index: int = 0) -> None:
-    """Render a single QueryResult dict from POST /query."""
     st.markdown(f"**You** · {result['question']}")
     st.markdown(f"**Assistant** &nbsp;&nbsp; {_confidence_badge(result['confidence'])}")
 
-    # Headline: post-processed metric if any, else the first row's values
     post = result.get("post_process", "none")
     rows = result.get("rows", [])
-    columns = result.get("columns", [])
 
     if post == "yoy_pct" and result.get("yoy_changes"):
         for ch in result["yoy_changes"]:
@@ -223,7 +328,6 @@ def render_answer(result: dict, index: int = 0) -> None:
             val = f"{r['value']:.4f}" if r["value"] is not None else "n/a"
             st.markdown(f"- **{r['numerator']} / {r['denominator']}**{period_lbl}: **{val}**")
     elif rows:
-        # Show the first 1-3 rows as the "headline"
         for r in rows[:3]:
             parts = [f"**{k}**: {_fmt_number(v)}" for k, v in r.items()]
             st.markdown("  ·  ".join(parts))
@@ -259,23 +363,39 @@ def render_answer(result: dict, index: int = 0) -> None:
         st.caption(f"Export unavailable: {e}")
 
 
+def _build_scope_for_query() -> dict[str, str]:
+    """Build the TenantScope payload for /query. Mandatory fields always
+    present; fin_year_id / reporting_period_id only included if filled
+    (so YoY questions across years can omit fin_year_id)."""
+    eng = _engagement()
+    scope = {k: eng[k] for k in _required_scope_keys()}
+    if eng.get("finYearId", "").strip():
+        scope["finYearId"] = eng["finYearId"]
+    if eng.get("reportingPeriodId", "").strip():
+        scope["reportingPeriodId"] = eng["reportingPeriodId"]
+    return scope
+
+
 def render_chat() -> None:
     if "chat" not in st.session_state:
-        st.session_state.chat = []  # list[dict] of QueryResult shapes
+        st.session_state.chat = []
 
     st.subheader("Ask a question")
+    st.caption("Answers are scoped to the active engagement. Clear FY or Reporting Period above to ask cross-period (YoY) questions.")
     for i, entry in enumerate(st.session_state.chat):
         render_answer(entry, index=i)
         st.divider()
 
     question = st.chat_input("What's the YoY change in current liabilities?")
     if question:
+        ok, missing = _engagement_valid_for_query()
+        if not ok:
+            st.error(f"Fill in the engagement fields first: {', '.join(missing)}")
+            return
+        scope = _build_scope_for_query()
         with st.spinner("Thinking…"):
             try:
-                with httpx.Client(timeout=TIMEOUT) as client:
-                    r = client.post(f"{API}/query", json={"question": question})
-                    r.raise_for_status()
-                    result = r.json()
+                result = _api("POST", "/query", json={"question": question, "scope": scope})
                 st.session_state.chat.append(result)
                 st.rerun()
             except httpx.HTTPError as e:
@@ -287,10 +407,14 @@ def render_chat() -> None:
                 st.error(f"Query failed: {e}. {detail}")
 
 
+# ---------- entry points ----------
+
+
 def main() -> None:
     st.set_page_config(page_title="ctb-copilot", layout="wide", page_icon="📊")
     st.title("ctb-copilot")
-    st.caption("Q&A over consolidated trial balance Excel files. Every answer shows its SQL and source rows.")
+    st.caption("Multi-tenant Q&A over consolidated trial balance data. Every answer shows its SQL and source rows.")
+    render_engagement_form()
     render_docdb_sync()
     render_sidebar()
     render_upload()
