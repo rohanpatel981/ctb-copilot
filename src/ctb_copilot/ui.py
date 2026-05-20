@@ -903,11 +903,6 @@ def render_chat() -> None:
     if "_pending_input_value" in st.session_state:
         st.session_state["chat_input_value"] = st.session_state.pop("_pending_input_value")
 
-    # First-load landing summary (only when there's no chat history yet).
-    if not st.session_state.chat:
-        _render_landing_summary()
-        st.divider()
-
     st.caption("Answers are scoped to the active engagement. Edit it in the sidebar.")
     for i, entry in enumerate(st.session_state.chat):
         render_answer(entry, index=i)
