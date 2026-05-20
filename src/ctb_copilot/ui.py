@@ -725,6 +725,16 @@ section[data-testid="stSidebar"] [data-testid="stExpander"] summary p {
     border-color: #6F42C1;
     box-shadow: 0 0 0 3px rgba(111, 66, 193, 0.15);
 }
+
+/* Suggestion-chip label */
+.ctb-chip-row-label {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #6B7280;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin: 8px 0 6px 0;
+}
 </style>
 """
 
@@ -765,16 +775,156 @@ def render_active_scope_chips() -> None:
     st.markdown(html, unsafe_allow_html=True)
 
 
+# Hand-curated "FAQ" shortcuts shown above the chat input. Click → fires
+# the question through the normal /query flow. The text is what the user
+# would have typed; the LLM handles interpretation as usual.
+_SUGGESTION_CHIPS: tuple[tuple[str, str], ...] = (
+    ("💰 Totals by category", "Total by FS category for the active period"),
+    ("🏢 Totals by entity", "Total consolidated amount by entity"),
+    ("🔝 Top 10 line items", "Top 10 GL codes by absolute consolidated amount"),
+    ("📉 YoY change in revenue", "YoY change in revenue"),
+    ("⚖️ Operating margin", "Operating margin for the active period"),
+    ("🧮 Adjustment breakdown", "Sum of each adjustment column (NCI, goodwill, PPA, intercompany, FCTR, retained earnings)"),
+    ("🔄 Reconcile consolidated vs reporting", "Decompose amount_consolidated into amount_reporting_ccy + each adj_* for each FS category"),
+    ("📐 Total of entire TB", "Total of the entire trial balance — should net to zero"),
+)
+
+
+def _render_suggestion_chips() -> None:
+    """Row of clickable shortcut buttons above the chat input. Click
+    populates the input box (so the user can tweak before sending) — does
+    NOT fire automatically. The input field is bound to session-state key
+    `chat_input_value`; chip clicks write to it and rerun so the textbox
+    picks up the new value."""
+    st.markdown("<div class='ctb-chip-row-label'>Suggested questions</div>", unsafe_allow_html=True)
+    cols = st.columns(4)
+    for i, (label, question) in enumerate(_SUGGESTION_CHIPS):
+        with cols[i % 4]:
+            if st.button(label, key=f"chip-{i}", use_container_width=True):
+                st.session_state["chat_input_value"] = question
+                st.rerun()
+
+
+def _render_landing_summary() -> None:
+    """TB at a glance — runs ONCE on landing (no chat yet) via the
+    non-LLM /summary endpoint. Cheap, predictable, no Anthropic call."""
+    ok, _ = _engagement_valid_for_query()
+    if not ok:
+        st.info(
+            "Set the active engagement in the sidebar to see a TB summary "
+            "and ask questions."
+        )
+        return
+
+    scope = _build_scope_for_query()
+    data = _api_safe("POST", "/summary", json={"scope": scope})
+    if not data:
+        return
+    if not data.get("has_data"):
+        st.info(
+            "No data synced for this engagement yet. Use the sidebar's "
+            "**🔄 Sync from DocumentDB** or **📤 Upload a CTB** to load rows."
+        )
+        return
+
+    fyp = data.get("fin_year_period") or ""
+    if fyp:
+        st.caption(f"Showing summary for **{fyp}** · scope locked above.")
+
+    # ----- top-of-page: 4 metric cards, one per FS category (biggest 4) -----
+    cats = data.get("by_category") or []
+    if cats:
+        top_cats = cats[:4]
+        metric_cols = st.columns(len(top_cats))
+        for col, cat in zip(metric_cols, top_cats):
+            with col:
+                st.metric(
+                    label=cat["fs_category"] or "—",
+                    value=_fmt_number(cat["total"]),
+                    delta=f"{cat['row_count']} GL lines",
+                    delta_color="off",
+                )
+
+    # ----- bar chart: amount by FS category -----
+    if cats:
+        chart_data = {c["fs_category"]: c["total"] for c in cats if c["fs_category"]}
+        if chart_data:
+            st.markdown("**Consolidated amount by FS category**")
+            st.bar_chart(chart_data, height=240, use_container_width=True)
+
+    # ----- two-column row: entity totals + top items -----
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Top entities by total**")
+        ents = data.get("by_entity") or []
+        if ents:
+            ent_table = [
+                {"Entity": e["entity_name"], "Total": _fmt_number(e["total"])}
+                for e in ents[:8]
+            ]
+            st.dataframe(ent_table, hide_index=True, use_container_width=True)
+        else:
+            st.caption("No entity data available.")
+    with right:
+        st.markdown("**Top 10 line items**")
+        items = data.get("top_items") or []
+        if items:
+            item_table = [
+                {
+                    "GL": f"{it['consol_gl_code']} · {it['consol_gl_description'] or ''}".strip(" ·"),
+                    "Entity": it["entity_name"] or "—",
+                    "Amount": _fmt_number(it["amount"]),
+                }
+                for it in items
+            ]
+            st.dataframe(item_table, hide_index=True, use_container_width=True)
+        else:
+            st.caption("No line items available.")
+
+    # ----- adjustment breakdown (only if any adjustments are non-zero) -----
+    adj = data.get("adjustment_totals") or []
+    if adj:
+        st.markdown("**Adjustment totals**")
+        adj_chart = {a["adjustment"].replace("adj_", ""): a["total"] for a in adj}
+        st.bar_chart(adj_chart, height=200, use_container_width=True)
+
+
 def render_chat() -> None:
     if "chat" not in st.session_state:
         st.session_state.chat = []
+
+    # First-load landing summary (only when there's no chat history yet).
+    if not st.session_state.chat:
+        _render_landing_summary()
+        st.divider()
 
     st.caption("Answers are scoped to the active engagement. Edit it in the sidebar.")
     for i, entry in enumerate(st.session_state.chat):
         render_answer(entry, index=i)
         st.divider()
 
-    question = st.chat_input("What's the YoY change in current liabilities?")
+    _render_suggestion_chips()
+
+    # Edit-then-send input. Bound to `chat_input_value` so chip clicks
+    # can prefill it via session state — the user reviews / tweaks /
+    # rephrases before hitting Send. Swapped from st.chat_input (which
+    # can't be programmatically prefilled) for this reason.
+    st.text_area(
+        "Your question",
+        key="chat_input_value",
+        height=80,
+        placeholder="Click a suggestion above, or type your own question…",
+        label_visibility="collapsed",
+    )
+    btn_cols = st.columns([1, 5, 1])
+    with btn_cols[0]:
+        send_clicked = st.button("Send", type="primary", use_container_width=True)
+    with btn_cols[2]:
+        if st.button("Clear", use_container_width=True):
+            st.session_state["chat_input_value"] = ""
+            st.rerun()
+
+    question = st.session_state.get("chat_input_value", "").strip() if send_clicked else None
     if question:
         ok, missing = _engagement_valid_for_query()
         if not ok:
@@ -785,6 +935,9 @@ def render_chat() -> None:
             try:
                 result = _api("POST", "/query", json={"question": question, "scope": scope})
                 st.session_state.chat.append(result)
+                # Clear the input so the same question doesn't sit there
+                # waiting to be re-submitted on the next click.
+                st.session_state["chat_input_value"] = ""
                 st.rerun()
             except httpx.HTTPError as e:
                 detail = ""
