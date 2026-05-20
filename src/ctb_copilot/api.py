@@ -283,6 +283,123 @@ def get_schema() -> dict:
     return {"ddl": LLM_SCHEMA_DDL}
 
 
+# ---------- landing summary (no LLM) ----------
+
+
+class SummaryRequest(BaseModel):
+    """Same shape as a QueryRequest scope — the 4-tuple (+optional 2)."""
+    scope: TenantScope
+
+
+class SummaryResponse(BaseModel):
+    """Precomputed analyst dashboard: total by category, by entity, top
+    line items. No LLM call — direct SQL on ctb_data. Cheap enough to
+    run on every landing without burning Anthropic budget."""
+    fin_year_period: str | None
+    has_data: bool
+    by_category: list[dict]
+    by_entity: list[dict]
+    top_items: list[dict]
+    adjustment_totals: list[dict]
+
+
+@app.post("/summary", response_model=SummaryResponse, dependencies=[Depends(verify_token)])
+def summary(req: SummaryRequest) -> SummaryResponse:
+    """Run a fixed set of analyst-shape aggregations against the tenant's
+    data and return numbers + groupings ready for the UI to chart.
+
+    No LLM is involved — these are hand-curated SQL queries with the
+    tenant filters injected. Used by the Streamlit landing page so the
+    user sees the TB-at-a-glance immediately, before typing anything.
+    """
+    pairs = req.scope.as_filter_pairs()
+    if not pairs:
+        return SummaryResponse(
+            fin_year_period=None, has_data=False,
+            by_category=[], by_entity=[], top_items=[], adjustment_totals=[],
+        )
+
+    where = " AND ".join(f"{col}=?" for col, _ in pairs)
+    values = [v for _, v in pairs]
+
+    with ro_connection(settings.duckdb_path) as conn:
+        # Pick the most-populated fin_year_period for display headline.
+        fyp_row = conn.execute(
+            f"SELECT fin_year_period, COUNT(*) AS n FROM ctb_data WHERE {where} "
+            "AND fin_year_period IS NOT NULL "
+            "GROUP BY fin_year_period ORDER BY n DESC LIMIT 1",
+            values,
+        ).fetchone()
+        fin_year_period = fyp_row[0] if fyp_row else None
+
+        total_rows = conn.execute(
+            f"SELECT COUNT(*) FROM ctb_data WHERE {where}", values
+        ).fetchone()[0]
+        has_data = bool(total_rows)
+
+        by_category = [
+            {"fs_category": r[0], "total": float(r[1] or 0), "row_count": r[2]}
+            for r in conn.execute(
+                f"SELECT fs_category, SUM(amount_consolidated) AS total, COUNT(*) AS n "
+                f"FROM ctb_data WHERE {where} AND fs_category IS NOT NULL "
+                "GROUP BY fs_category ORDER BY ABS(SUM(amount_consolidated)) DESC",
+                values,
+            ).fetchall()
+        ]
+
+        by_entity = [
+            {"entity_name": r[0], "total": float(r[1] or 0), "row_count": r[2]}
+            for r in conn.execute(
+                f"SELECT entity_name, SUM(amount_consolidated) AS total, COUNT(*) AS n "
+                f"FROM ctb_data WHERE {where} AND entity_name IS NOT NULL "
+                "GROUP BY entity_name ORDER BY ABS(SUM(amount_consolidated)) DESC "
+                "LIMIT 20",
+                values,
+            ).fetchall()
+        ]
+
+        top_items = [
+            {
+                "consol_gl_code": r[0], "consol_gl_description": r[1],
+                "entity_name": r[2], "fs_category": r[3],
+                "amount": float(r[4] or 0),
+            }
+            for r in conn.execute(
+                "SELECT consol_gl_code, consol_gl_description, entity_name, "
+                "fs_category, amount_consolidated "
+                f"FROM ctb_data WHERE {where} "
+                "AND amount_consolidated IS NOT NULL "
+                "ORDER BY ABS(amount_consolidated) DESC LIMIT 10",
+                values,
+            ).fetchall()
+        ]
+
+        # Sum each adjustment column. None / 0 columns are dropped on the UI side.
+        adj_cols = (
+            "adj_other_consolidated", "adj_nci", "adj_goodwill", "adj_ppa",
+            "adj_intercompany", "adj_investment_capital",
+            "adj_retained_earnings", "adj_fctr",
+        )
+        select_list = ", ".join(f"SUM({c})" for c in adj_cols)
+        adj_row = conn.execute(
+            f"SELECT {select_list} FROM ctb_data WHERE {where}", values
+        ).fetchone()
+        adjustment_totals = [
+            {"adjustment": col, "total": float(val or 0)}
+            for col, val in zip(adj_cols, adj_row or [])
+            if val and abs(val) > 0.005
+        ]
+
+    return SummaryResponse(
+        fin_year_period=fin_year_period,
+        has_data=has_data,
+        by_category=by_category,
+        by_entity=by_entity,
+        top_items=top_items,
+        adjustment_totals=adjustment_totals,
+    )
+
+
 @app.post("/query", response_model=QueryResult, dependencies=[Depends(verify_token)])
 async def query(req: QueryRequest) -> QueryResult:
     if not req.question.strip():
