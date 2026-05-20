@@ -142,7 +142,25 @@ _URL_PARAM_TO_SESSION_KEY: dict[str, str] = {
     "reportingPeriodId": "eng-reportingPeriodId",
     "currencyId": "eng-currencyId",
     "finYearPeriod": "eng-finYearPeriod",
+    # Human-readable names (display only — IDs above are what scope the data).
+    "clientName": "eng-clientName",
+    "gaapName": "eng-gaapName",
+    "parentName": "eng-parentName",
+    "finYearName": "eng-finYearName",
+    "periodName": "eng-periodName",
+    "currencyName": "eng-currencyName",
 }
+
+# Pairs of (id session-key, name session-key) used by the scope-chip
+# renderer to prefer the human-readable name over the opaque ID.
+_ID_NAME_PAIRS: tuple[tuple[str, str, str], ...] = (
+    ("eng-clientId", "eng-clientName", "Client"),
+    ("eng-reportingParentCompanyId", "eng-parentName", "Parent"),
+    ("eng-gaapId", "eng-gaapName", "GAAP"),
+    ("eng-finYearId", "eng-finYearName", "FY"),
+    ("eng-reportingPeriodId", "eng-periodName", "Period"),
+    ("eng-currencyId", "eng-currencyName", "Currency"),
+)
 
 
 def _prefill_engagement_from_query_params() -> None:
@@ -155,10 +173,34 @@ def _prefill_engagement_from_query_params() -> None:
     """
     if st.session_state.get("_engagement_prefilled"):
         return
+    locked: set[str] = set()
     for url_key, session_key in _URL_PARAM_TO_SESSION_KEY.items():
         value = st.query_params.get(url_key)
         if value:
             st.session_state[session_key] = value
+            # Only ID fields get locked — names are display-only metadata
+            # and the finYearPeriod label is user-editable by design.
+            if session_key.startswith("eng-") and session_key.endswith("Id"):
+                locked.add(session_key)
+    st.session_state["_locked_engagement_keys"] = locked
+
+    # Parse the optional finYears JSON list — [{id, name}, ...]. When
+    # supplied, the engagement form renders a selectbox bound to
+    # eng-finYearId so the user can switch FYs without typing UUIDs.
+    fin_years_raw = st.query_params.get("finYears")
+    fin_years_options: list[dict[str, str]] = []
+    if fin_years_raw:
+        try:
+            parsed = json.loads(fin_years_raw)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    fy_id = (item or {}).get("id")
+                    fy_name = (item or {}).get("name")
+                    if fy_id and fy_name:
+                        fin_years_options.append({"id": str(fy_id), "name": str(fy_name)})
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    st.session_state["_fin_year_options"] = fin_years_options
     st.session_state["_engagement_prefilled"] = True
 
 
@@ -172,34 +214,94 @@ def render_engagement_form() -> None:
     main area stays the hero. Expanded by default only when something's
     missing."""
     ok, _missing = _engagement_valid_for_sync()
+    # Map engagement-id field-key → session-state key holding the
+    # human-readable name (when the parent FE passed one in the URL).
+    _id_to_name_key: dict[str, str] = {
+        "clientId": "eng-clientName",
+        "gaapId": "eng-gaapName",
+        "reportingParentCompanyId": "eng-parentName",
+        "finYearId": "eng-finYearName",
+        "reportingPeriodId": "eng-periodName",
+        "currencyId": "eng-currencyName",
+    }
+    locked_keys: set[str] = st.session_state.get("_locked_engagement_keys") or set()
+    fin_year_options: list[dict[str, str]] = st.session_state.get("_fin_year_options") or []
     with st.expander("🎯 Active engagement", expanded=not ok):
         st.caption("Every API call is scoped to this tuple.")
         for key, label in _ENGAGEMENT_FIELDS:
+            session_key = f"eng-{key}"
+            is_locked = session_key in locked_keys
+            name_val = (st.session_state.get(_id_to_name_key.get(key, ""), "") or "").strip()
+
+            # Special-case finYearId when the host passed a list of
+            # available FYs — render a selectbox so the user can switch
+            # without typing UUIDs. The bound value is the ID; sync uses
+            # whatever's currently selected.
+            if key == "finYearId" and fin_year_options:
+                ids = [opt["id"] for opt in fin_year_options]
+                current_id = st.session_state.get(session_key, _DEFAULT_ENGAGEMENT[key])
+                try:
+                    default_index = ids.index(current_id) if current_id in ids else 0
+                except ValueError:
+                    default_index = 0
+                selected_id = st.selectbox(
+                    label,
+                    options=ids,
+                    index=default_index,
+                    key=f"{session_key}-select",
+                    format_func=lambda i: next(
+                        (o["name"] for o in fin_year_options if o["id"] == i), i
+                    ),
+                    help="Pick a financial year — sync will use the selected ID.",
+                )
+                # Keep the canonical eng-finYearId session value in sync
+                # with the selectbox, and refresh the matching name.
+                st.session_state[session_key] = selected_id
+                matched_name = next(
+                    (o["name"] for o in fin_year_options if o["id"] == selected_id), ""
+                )
+                if matched_name:
+                    st.session_state["eng-finYearName"] = matched_name
+                continue
+
+            # Locked field — render as compact read-only "row" instead
+            # of a greyed-out input: bold label + name as the primary
+            # value, with the underlying ID shown smaller / muted below.
+            # Keeps the visual focus on what humans recognise.
+            if is_locked:
+                id_val = st.session_state.get(session_key, "")
+                primary = name_val or id_val or "—"
+                st.markdown(
+                    f"<div class='ctb-locked-row'>"
+                    f"<div class='ctb-locked-label'>{label}</div>"
+                    f"<div class='ctb-locked-value'>{primary}</div>"
+                    + (f"<div class='ctb-locked-id'>{id_val}</div>" if name_val and id_val else "")
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+                continue
+
             st.text_input(
                 label,
-                value=st.session_state.get(f"eng-{key}", _DEFAULT_ENGAGEMENT[key]),
-                key=f"eng-{key}",
+                value=st.session_state.get(session_key, _DEFAULT_ENGAGEMENT[key]),
+                key=session_key,
             )
 
-        st.text_input(
-            "Financial year period (label)",
-            value=st.session_state.get("eng-finYearPeriod", ""),
-            key="eng-finYearPeriod",
-            placeholder="FY 2024-25",
-            help=(
-                "Human-readable label tagged on every synced row. The assistant "
-                "filters years using this, not the UUIDs."
-            ),
+        # Financial-year-period label: read-only, derived from the FY
+        # name supplied by the host. Falls back to whatever the user
+        # already had in session state (e.g. a manual default).
+        fyp_value = (
+            (st.session_state.get("eng-finYearName") or "").strip()
+            or (st.session_state.get("eng-finYearPeriod") or "").strip()
         )
-
-        if settings.api_token is None:
-            st.text_input(
-                "API token",
-                value=st.session_state.get("api_token", ""),
-                key="api_token",
-                type="password",
-                help="Authorization: Bearer …. Leave blank in dev mode.",
-            )
+        st.session_state["eng-finYearPeriod"] = fyp_value
+        st.markdown(
+            f"<div class='ctb-locked-row'>"
+            f"<div class='ctb-locked-label'>Financial year period</div>"
+            f"<div class='ctb-locked-value'>{fyp_value or '—'}</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def _engagement_fin_year_period() -> str | None:
@@ -583,6 +685,36 @@ section[data-testid="stSidebar"] [data-testid="stExpander"] summary p {
     background: #F3F4F6; color: #6B7280; border-color: #E5E7EB;
 }
 
+/* Locked engagement row (sidebar): compact label + bold value + muted ID. */
+.ctb-locked-row {
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    border: 1px solid #E5E0F2;
+    border-radius: 8px;
+    background: #FAFAFE;
+}
+.ctb-locked-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #6B7280;
+    margin-bottom: 2px;
+}
+.ctb-locked-value {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #1F2937;
+    line-height: 1.25;
+    word-break: break-word;
+}
+.ctb-locked-id {
+    font-size: 0.72rem;
+    color: #9CA3AF;
+    margin-top: 2px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    word-break: break-all;
+}
+
 /* Chat input: make it the visual focus. */
 [data-testid="stChatInput"] textarea {
     font-size: 1.05rem;
@@ -603,20 +735,26 @@ def _inject_brand_css() -> None:
 
 def render_active_scope_chips() -> None:
     """Top-of-main pills summarising the active engagement at a glance.
+    Prefer the human-readable name (passed via URL `…Name` params) and
+    fall back to a truncated ID when no name is available.
     Read-only — edits happen in the sidebar's `Active engagement` expander."""
-    eng = _engagement()
-    fyp = _engagement_fin_year_period()
     chips: list[tuple[str, bool]] = []  # (text, is_set)
+    fyp = _engagement_fin_year_period()
     if fyp:
         chips.append((fyp, True))
-    elif eng.get("finYearId", "").strip():
-        chips.append((f"FY · {eng['finYearId'][:8]}…", True))
-    if eng.get("reportingPeriodId", "").strip():
-        chips.append((f"Period · {eng['reportingPeriodId'][:8]}…", True))
-    if eng.get("clientId", "").strip():
-        chips.append((f"Client · {eng['clientId']}", True))
-    if eng.get("currencyId", "").strip():
-        chips.append((f"Currency · {eng['currencyId'][:8]}…", True))
+
+    for id_key, name_key, label in _ID_NAME_PAIRS:
+        # finYearPeriod takes precedence over FY/Period chips when set,
+        # so skip those two to avoid noise.
+        if fyp and label in ("FY", "Period"):
+            continue
+        name_val = (st.session_state.get(name_key) or "").strip()
+        id_val = (st.session_state.get(id_key) or "").strip()
+        if name_val:
+            chips.append((f"{label} · {name_val}", True))
+        elif id_val:
+            chips.append((f"{label} · {id_val[:8]}…", True))
+
     if not chips:
         chips.append(("No engagement set", False))
     html = "<div class='ctb-chips'>"
