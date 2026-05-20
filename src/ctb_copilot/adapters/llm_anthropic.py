@@ -133,6 +133,74 @@ Use `amount_reporting_ccy` if and only if:
 
    **ALWAYS pick a formula and COMPUTE.** Never return raw totals and ask the analyst to do the math. State the interpretation you picked in `explanation`.
 
+6. **Variance analysis** ("variance", "compare", "movement between periods", "what changed"): two periods side-by-side with absolute and percent change, sorted by magnitude of change so the biggest movers come first.
+
+   SQL shape:
+   ```sql
+   SELECT fs_category,  -- or bs_classification, fsli, entity_name etc. — pick the grain the user named, default to fs_category
+          SUM(CASE WHEN fin_year_period = '<period A>' THEN amount_consolidated ELSE 0 END) AS period_a,
+          SUM(CASE WHEN fin_year_period = '<period B>' THEN amount_consolidated ELSE 0 END) AS period_b,
+          SUM(CASE WHEN fin_year_period = '<period B>' THEN amount_consolidated ELSE 0 END)
+            - SUM(CASE WHEN fin_year_period = '<period A>' THEN amount_consolidated ELSE 0 END) AS abs_change,
+          (SUM(CASE WHEN fin_year_period = '<period B>' THEN amount_consolidated ELSE 0 END)
+            - SUM(CASE WHEN fin_year_period = '<period A>' THEN amount_consolidated ELSE 0 END))
+            / NULLIF(ABS(SUM(CASE WHEN fin_year_period = '<period A>' THEN amount_consolidated ELSE 0 END)), 0)
+            * 100 AS percent_change
+   FROM ctb_data
+   WHERE fin_year_period IN ('<period A>', '<period B>')
+   GROUP BY fs_category
+   ORDER BY ABS(abs_change) DESC;
+   ```
+   `post_process = "none"` (math is inline). Confidence high if periods are clearly named; medium if you had to guess which two periods. If only ONE period is loaded in the vocabulary, run the query anyway and explain in the answer that the second period is empty — don't refuse.
+
+7. **Materiality threshold filter** ("material", ">5%", "biggest movers", "only show items that moved", "changed by", "moved by", "increased by", "decreased by"): same variance shape as rule 6 but wrap in a HAVING clause whose direction depends on the user's wording.
+
+   **Parse the threshold + direction from the user's natural language:**
+
+   | User phrasing | Filter | Direction |
+   |---|---|---|
+   | "moved by more than X%" / "changed by X%" | `ABS(percent_change) > X` | both directions |
+   | "increased by X% or more" / "grew by X%" / "rose by X%" | `percent_change > X` | positive only |
+   | "decreased by X%" / "fell by X%" / "dropped by X%" | `percent_change < -X` | negative only |
+   | "moved by more than ₹X" / "changed by X (absolute)" | `ABS(abs_change) > X` | both directions |
+   | "increased by ₹X or more" | `abs_change > X` | positive only |
+   | "decreased by ₹X" / "fell by ₹X" | `abs_change < -X` | negative only |
+   | "material" with no number | `ABS(percent_change) > 5 OR ABS(abs_change) > 5000` | both directions |
+
+   The user often specifies just ONE threshold (percentage OR absolute), not both — use just that one. Document the threshold + direction in `explanation`.
+
+   Examples:
+   - *"Categories that moved by more than 3%"* → `HAVING ABS(percent_change) > 3`
+   - *"Show categories that decreased by 10% or more"* → `HAVING percent_change < -10`
+   - *"Lines that grew by more than 50,000"* → `HAVING abs_change > 50000`
+   - *"Material movements"* → `HAVING ABS(percent_change) > 5 OR ABS(abs_change) > 5000`
+
+8. **Sign-convention check** ("sign check", "wrong sign", "TB convention violation"): find categories or rows whose total sign violates standard trial-balance convention.
+
+   Convention: Assets, Expenses, Tax expense → expected SUM > 0 (positive). Liabilities, Equity, Revenue, Other Comprehensive → expected SUM < 0 (negative). Use a CASE to label the expected sign per category, then filter for mismatches:
+   ```sql
+   SELECT fs_category,
+          SUM(amount_consolidated) AS actual_total,
+          CASE
+            WHEN fs_category IN ('Assets', 'Expenses', 'Expense', 'Tax expense') THEN 'positive'
+            WHEN fs_category IN ('Liabilities', 'Equity', 'Revenue', 'Other Comprehensive') THEN 'negative'
+            ELSE 'unknown'
+          END AS expected_sign,
+          CASE
+            WHEN SUM(amount_consolidated) > 0 THEN 'positive'
+            WHEN SUM(amount_consolidated) < 0 THEN 'negative'
+            ELSE 'zero'
+          END AS actual_sign
+   FROM ctb_data WHERE ...
+   GROUP BY fs_category
+   HAVING ABS(SUM(amount_consolidated)) > 100  -- ignore immaterial near-zero noise
+     AND (
+       (fs_category IN ('Assets', 'Expenses', 'Expense', 'Tax expense') AND SUM(amount_consolidated) < 0)
+       OR (fs_category IN ('Liabilities', 'Equity', 'Revenue', 'Other Comprehensive') AND SUM(amount_consolidated) > 0)
+     );
+   ```
+   Use the *live vocabulary* values for fs_category (your data might say 'Expenses' plural or 'Expense' singular — the IN-list should cover both forms present in the vocab block above). `post_process = "none"`. If the result is empty, the explanation should celebrate it ("All FS categories follow TB convention"). If non-empty, the explanation should be precise about which categories are flipped and the likely cause (data-side sign-flip, source-system convention, etc. — don't speculate without evidence, just describe what's there).
+
 # Rules
 
 - Output exactly ONE SELECT statement. NEVER `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `CREATE`, `ATTACH`, `COPY`, or any DDL.

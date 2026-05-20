@@ -782,11 +782,14 @@ _SUGGESTION_CHIPS: tuple[tuple[str, str], ...] = (
     ("💰 Totals by category", "Total by FS category for the active period"),
     ("🏢 Totals by entity", "Total consolidated amount by entity"),
     ("🔝 Top 10 line items", "Top 10 GL codes by absolute consolidated amount"),
-    ("📉 YoY change in revenue", "YoY change in revenue"),
+    ("📊 Variance analysis", "Variance analysis between all loaded financial year periods, broken down by FS category. Show both years' totals, absolute change, and percent change. Sort by absolute change descending so the biggest movers come first."),
+    ("🎯 Material movements", "Variance analysis between all loaded financial year periods at FS category level, but ONLY show categories whose absolute change exceeds 5% OR whose absolute change exceeds 5,000 (in reporting currency). Sort by magnitude."),
+    ("🚨 Sign-convention check", "Find FS categories whose total amount_consolidated does NOT follow trial-balance convention. Expected: Assets and Expenses positive (SUM > 0); Liabilities, Equity, Revenue, Tax expense, Other Comprehensive negative (SUM < 0). Return the offending categories with their actual total and the sign they should have. Flag only material amounts (|total| > 100)."),
     ("⚖️ Operating margin", "Operating margin for the active period"),
     ("🧮 Adjustment breakdown", "Sum of each adjustment column (NCI, goodwill, PPA, intercompany, FCTR, retained earnings)"),
     ("🔄 Reconcile consolidated vs reporting", "Decompose amount_consolidated into amount_reporting_ccy + each adj_* for each FS category"),
     ("📐 Total of entire TB", "Total of the entire trial balance — should net to zero"),
+    ("📉 YoY change in revenue", "YoY change in revenue across loaded years"),
 )
 
 
