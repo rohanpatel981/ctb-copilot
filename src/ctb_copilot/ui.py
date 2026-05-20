@@ -801,7 +801,8 @@ def _render_suggestion_chips() -> None:
     for i, (label, question) in enumerate(_SUGGESTION_CHIPS):
         with cols[i % 4]:
             if st.button(label, key=f"chip-{i}", use_container_width=True):
-                st.session_state["chat_input_value"] = question
+                # Stage for next run — see render_chat top comment.
+                st.session_state["_pending_input_value"] = question
                 st.rerun()
 
 
@@ -893,6 +894,15 @@ def render_chat() -> None:
     if "chat" not in st.session_state:
         st.session_state.chat = []
 
+    # Apply any pending input-box value BEFORE the text_area is
+    # instantiated. Streamlit forbids writing to a widget's
+    # session-state key after that widget renders in the same run, so
+    # chip clicks / Send-clear / Clear-button all write to
+    # _pending_input_value and rerun; here we move it into
+    # chat_input_value while no widget exists yet in this run.
+    if "_pending_input_value" in st.session_state:
+        st.session_state["chat_input_value"] = st.session_state.pop("_pending_input_value")
+
     # First-load landing summary (only when there's no chat history yet).
     if not st.session_state.chat:
         _render_landing_summary()
@@ -921,7 +931,7 @@ def render_chat() -> None:
         send_clicked = st.button("Send", type="primary", use_container_width=True)
     with btn_cols[2]:
         if st.button("Clear", use_container_width=True):
-            st.session_state["chat_input_value"] = ""
+            st.session_state["_pending_input_value"] = ""
             st.rerun()
 
     question = st.session_state.get("chat_input_value", "").strip() if send_clicked else None
@@ -935,9 +945,9 @@ def render_chat() -> None:
             try:
                 result = _api("POST", "/query", json={"question": question, "scope": scope})
                 st.session_state.chat.append(result)
-                # Clear the input so the same question doesn't sit there
-                # waiting to be re-submitted on the next click.
-                st.session_state["chat_input_value"] = ""
+                # Stage the clear for the next run — the text_area
+                # widget has already been instantiated above in this run.
+                st.session_state["_pending_input_value"] = ""
                 st.rerun()
             except httpx.HTTPError as e:
                 detail = ""
