@@ -123,18 +123,31 @@ def inject_tenant_filters(sql: str, scope) -> str:
     return tree.sql(dialect="duckdb")
 
 
+# Candidate period-column names in the SELECT result. v0.4 used `period`;
+# v0.5+ uses `fin_year_period`. Post-processors accept either.
+_PERIOD_COL_CANDIDATES = ("fin_year_period", "period")
+
+
+def _find_period_col(columns: list[str]) -> str | None:
+    for c in _PERIOD_COL_CANDIDATES:
+        if c in columns:
+            return c
+    return None
+
+
 def _compute_yoy(rows: list[dict], columns: list[str]) -> list[YoYChange]:
     """Compute YoY % change for each numeric column between consecutive periods.
 
     Expects rows already ordered by period. Sign convention is preserved: dividing
     by the signed prior-period value naturally handles liabilities/revenue.
-    Returns empty list if `period` isn't in columns.
+    Returns empty list if no period column is present.
     """
-    if "period" not in columns or len(rows) < 2:
+    period_col = _find_period_col(columns)
+    if period_col is None or len(rows) < 2:
         return []
     numeric_cols = [
         c for c in columns
-        if c != "period" and any(isinstance(r.get(c), (int, float)) for r in rows)
+        if c != period_col and any(isinstance(r.get(c), (int, float)) for r in rows)
     ]
     changes: list[YoYChange] = []
     for prev, curr in zip(rows, rows[1:]):
@@ -148,8 +161,8 @@ def _compute_yoy(rows: list[dict], columns: list[str]) -> list[YoYChange]:
             else:
                 pct = round((curr_val - prev_val) / prev_val * 100, 4)
             changes.append(YoYChange(
-                from_period=str(prev["period"]),
-                to_period=str(curr["period"]),
+                from_period=str(prev[period_col]),
+                to_period=str(curr[period_col]),
                 metric=col,
                 from_value=float(prev_val),
                 to_value=float(curr_val),
@@ -159,10 +172,12 @@ def _compute_yoy(rows: list[dict], columns: list[str]) -> list[YoYChange]:
 
 
 def _compute_ratio(rows: list[dict], columns: list[str]) -> list[dict]:
-    """If two numeric columns exist (besides period), return col1/col2 per row."""
+    """If two numeric columns exist (besides the period column), return
+    col1/col2 per row."""
+    period_col = _find_period_col(columns)
     numeric_cols = [
         c for c in columns
-        if c != "period" and any(isinstance(r.get(c), (int, float)) for r in rows)
+        if c != period_col and any(isinstance(r.get(c), (int, float)) for r in rows)
     ]
     if len(numeric_cols) < 2:
         return []
@@ -172,8 +187,8 @@ def _compute_ratio(rows: list[dict], columns: list[str]) -> list[dict]:
         num, den = r.get(num_col), r.get(den_col)
         value = (num / den) if isinstance(num, (int, float)) and isinstance(den, (int, float)) and den != 0 else None
         entry = {"numerator": num_col, "denominator": den_col, "value": value}
-        if "period" in columns:
-            entry["period"] = r.get("period")
+        if period_col is not None:
+            entry["period"] = r.get(period_col)
         ratios.append(entry)
     return ratios
 
