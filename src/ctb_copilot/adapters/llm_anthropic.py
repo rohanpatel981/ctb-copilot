@@ -153,12 +153,27 @@ Use `amount_reporting_ccy` if and only if:
    ```
    `post_process = "none"` (math is inline). Confidence high if periods are clearly named; medium if you had to guess which two periods. If only ONE period is loaded in the vocabulary, run the query anyway and explain in the answer that the second period is empty — don't refuse.
 
-7. **Materiality threshold filter** ("material", ">5%", "biggest movers", "only show items that moved"): same variance shape as rule 6 but wrap in a HAVING clause:
-   ```sql
-   HAVING ABS(abs_change) > <threshold-amount>
-       OR ABS(percent_change) > <threshold-percent>
-   ```
-   Default threshold: 5% relative OR 5,000 absolute (in reporting currency), unless the user specifies. Document the threshold you used in `explanation`.
+7. **Materiality threshold filter** ("material", ">5%", "biggest movers", "only show items that moved", "changed by", "moved by", "increased by", "decreased by"): same variance shape as rule 6 but wrap in a HAVING clause whose direction depends on the user's wording.
+
+   **Parse the threshold + direction from the user's natural language:**
+
+   | User phrasing | Filter | Direction |
+   |---|---|---|
+   | "moved by more than X%" / "changed by X%" | `ABS(percent_change) > X` | both directions |
+   | "increased by X% or more" / "grew by X%" / "rose by X%" | `percent_change > X` | positive only |
+   | "decreased by X%" / "fell by X%" / "dropped by X%" | `percent_change < -X` | negative only |
+   | "moved by more than ₹X" / "changed by X (absolute)" | `ABS(abs_change) > X` | both directions |
+   | "increased by ₹X or more" | `abs_change > X` | positive only |
+   | "decreased by ₹X" / "fell by ₹X" | `abs_change < -X` | negative only |
+   | "material" with no number | `ABS(percent_change) > 5 OR ABS(abs_change) > 5000` | both directions |
+
+   The user often specifies just ONE threshold (percentage OR absolute), not both — use just that one. Document the threshold + direction in `explanation`.
+
+   Examples:
+   - *"Categories that moved by more than 3%"* → `HAVING ABS(percent_change) > 3`
+   - *"Show categories that decreased by 10% or more"* → `HAVING percent_change < -10`
+   - *"Lines that grew by more than 50,000"* → `HAVING abs_change > 50000`
+   - *"Material movements"* → `HAVING ABS(percent_change) > 5 OR ABS(abs_change) > 5000`
 
 8. **Sign-convention check** ("sign check", "wrong sign", "TB convention violation"): find categories or rows whose total sign violates standard trial-balance convention.
 
