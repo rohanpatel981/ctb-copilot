@@ -791,15 +791,17 @@ _SUGGESTION_CHIPS: tuple[tuple[str, str], ...] = (
 
 
 def _render_suggestion_chips() -> None:
-    """Row of clickable shortcut buttons above the chat input. Click sets
-    a session-state question that the chat handler picks up on the next
-    rerun and fires through the normal /query flow."""
+    """Row of clickable shortcut buttons above the chat input. Click
+    populates the input box (so the user can tweak before sending) — does
+    NOT fire automatically. The input field is bound to session-state key
+    `chat_input_value`; chip clicks write to it and rerun so the textbox
+    picks up the new value."""
     st.markdown("<div class='ctb-chip-row-label'>Suggested questions</div>", unsafe_allow_html=True)
     cols = st.columns(4)
     for i, (label, question) in enumerate(_SUGGESTION_CHIPS):
         with cols[i % 4]:
             if st.button(label, key=f"chip-{i}", use_container_width=True):
-                st.session_state["_pending_question"] = question
+                st.session_state["chat_input_value"] = question
                 st.rerun()
 
 
@@ -903,11 +905,26 @@ def render_chat() -> None:
 
     _render_suggestion_chips()
 
-    # A chip-click in the previous run wrote to _pending_question; pick that
-    # up here and fire it as if the user had typed it.
-    chip_question = st.session_state.pop("_pending_question", None)
-    typed_question = st.chat_input("Ask anything about your CTB…")
-    question = chip_question or typed_question
+    # Edit-then-send input. Bound to `chat_input_value` so chip clicks
+    # can prefill it via session state — the user reviews / tweaks /
+    # rephrases before hitting Send. Swapped from st.chat_input (which
+    # can't be programmatically prefilled) for this reason.
+    st.text_area(
+        "Your question",
+        key="chat_input_value",
+        height=80,
+        placeholder="Click a suggestion above, or type your own question…",
+        label_visibility="collapsed",
+    )
+    btn_cols = st.columns([1, 5, 1])
+    with btn_cols[0]:
+        send_clicked = st.button("Send", type="primary", use_container_width=True)
+    with btn_cols[2]:
+        if st.button("Clear", use_container_width=True):
+            st.session_state["chat_input_value"] = ""
+            st.rerun()
+
+    question = st.session_state.get("chat_input_value", "").strip() if send_clicked else None
     if question:
         ok, missing = _engagement_valid_for_query()
         if not ok:
@@ -918,6 +935,9 @@ def render_chat() -> None:
             try:
                 result = _api("POST", "/query", json={"question": question, "scope": scope})
                 st.session_state.chat.append(result)
+                # Clear the input so the same question doesn't sit there
+                # waiting to be re-submitted on the next click.
+                st.session_state["chat_input_value"] = ""
                 st.rerun()
             except httpx.HTTPError as e:
                 detail = ""
