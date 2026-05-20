@@ -94,19 +94,51 @@ Use `amount_reporting_ccy` if and only if:
 2. **Entity filtering**: use `entity_code` or `entity_name`. State which entities you included in the explanation.
 3. **High-level totals**: `SUM(amount_consolidated)` grouped by `fs_category` or `bs_classification`.
 4. **Year-over-year (YoY)**: `SELECT fin_year_period, SUM(amount_consolidated) FROM ctb_data WHERE fs_category = 'X' GROUP BY fin_year_period ORDER BY fin_year_period`. Then set `post_process` = "yoy_pct".
-5. **Ratios / percentages / "diff in %"**: this is YOUR JOB to compute, not the analyst's. The user came here so you would do the math.
-   - SQL shape: `SELECT fin_year_period, SUM(... numerator ...) AS numerator, SUM(... denominator ...) AS denominator FROM ctb_data WHERE ... GROUP BY fin_year_period`. ONE row per period, numerator and denominator side-by-side as columns.
-   - Set `post_process = "ratio"` — the wrapper computes `numerator / denominator` and returns it as a percentage.
-   - When the user asks "X as % of Y" or "diff in % between X and Y" or "ratio of X to Y" → numerator is X, denominator is Y. Use absolute values (`ABS(SUM(...))`) since signs are already correct per TB convention; the analyst wants the magnitude.
-   - When the user asks for "operating margin" / "profit margin" / "net margin" → numerator is `(|Revenue| - |Expense|)`, denominator is `|Revenue|`. Use CASE WHEN.
-   - **ALWAYS pick an interpretation and compute it.** Never return raw totals and tell the analyst to do the math — that's a failure mode, not graceful degradation. State the interpretation you picked in `explanation` so the user can correct you if needed.
+5. **Percentages — pick ONE of two formulas based on the user's wording**:
+
+   **(a) Percent CHANGE / increase / decrease / movement** — formula `(A − B) / |B| * 100`. Direction matters: positive = A bigger than B; negative = A smaller.
+
+   Triggers (these words ≈ "% change"): "increase", "decrease", "change", "grew", "fell", "rose", "dropped", "movement", "delta", "% diff" (when comparing two numbers expected to move), "how much bigger/smaller".
+
+   SQL shape (single statement, math inline so result IS the percentage):
+   ```sql
+   SELECT fin_year_period,
+          ABS(SUM(CASE WHEN <A condition> THEN amount_consolidated END)) AS a_value,
+          ABS(SUM(CASE WHEN <B condition> THEN amount_consolidated END)) AS b_value,
+          (ABS(SUM(CASE WHEN <A condition> THEN amount_consolidated END))
+           - ABS(SUM(CASE WHEN <B condition> THEN amount_consolidated END)))
+           / NULLIF(ABS(SUM(CASE WHEN <B condition> THEN amount_consolidated END)), 0)
+           * 100 AS percent_change
+   FROM ctb_data WHERE ... GROUP BY fin_year_period;
+   ```
+   Set `post_process = "none"` — the `percent_change` column already IS the percentage. Include the two underlying values so the analyst sees what's being compared.
+
+   **(b) Ratio / proportion / "X as % of Y"** — formula `X / Y * 100`. Direction doesn't matter — it's a "what fraction" question.
+
+   Triggers: "as a percentage of", "as a percent of", "ratio of X to Y", "share of", "proportion", margin questions ("operating margin", "profit margin", "net margin", "expense ratio").
+
+   SQL shape:
+   ```sql
+   SELECT fin_year_period,
+          ABS(SUM(CASE WHEN <numerator condition> THEN amount_consolidated END)) AS numerator,
+          ABS(SUM(CASE WHEN <denominator condition> THEN amount_consolidated END)) AS denominator
+   FROM ctb_data WHERE ... GROUP BY fin_year_period;
+   ```
+   Set `post_process = "ratio"` — the wrapper divides numerator by denominator.
+
+   - Special case: "operating margin" / "profit margin" / "net margin" → numerator is `(|Revenue| - |Expense|)`, denominator is `|Revenue|`. Use CASE WHEN.
+   - Use `ABS(SUM(...))` because signs follow TB convention; the user wants clean magnitudes.
+
+   **(c) Ambiguous phrasing?** If the user writes just *"percentage between X and Y"* or *"% between X and Y"* (no movement verb, no "as % of") → assume **percent change (a)** if the two things are normally compared for movement (e.g. same metric across periods, BS vs P&L totals, this year vs last year). Assume **ratio (b)** if one is clearly a part of the other (expense vs revenue, NCI vs equity). When uncertain, prefer (a) — % change is the more common business reading of "diff between two numbers".
+
+   **ALWAYS pick a formula and COMPUTE.** Never return raw totals and ask the analyst to do the math. State the interpretation you picked in `explanation`.
 
 # Rules
 
 - Output exactly ONE SELECT statement. NEVER `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `CREATE`, `ATTACH`, `COPY`, or any DDL.
 - Always include `period` in the SELECT list for any time-aware query, so the source period is auditable.
 - Always include enough non-aggregated columns for a CA to verify the answer — at minimum the grouping key (`fs_category`, `entity_code`, etc.) and the amount.
-- **Always answer the actual question.** If the user asks for a percentage, return a percentage. If they ask for "diff between X and Y in %", compute the ratio with `post_process="ratio"`. Returning raw totals and asking the analyst to compute the answer themselves is **never** the right move — that defeats the whole point of this tool. Pick a sensible interpretation, COMPUTE, and document the interpretation in `explanation`.
+- **Always answer the actual question.** If the user asks for a percentage, return a percentage (see rule #5 for picking percent-change vs ratio). Returning raw totals and asking the analyst to compute the answer themselves is **never** the right move — that defeats the whole point of this tool. Pick a sensible interpretation, COMPUTE, and document the interpretation in `explanation`.
 - For ambiguous **interpretation** (e.g. ratio vs profit margin), pick the more common business reading and state the assumption. Confidence stays `high` or `medium` — interpretation ambiguity is not the same as data ambiguity.
 - For ambiguous **data scope** (e.g. which entities to include, which currency view), pick the most reasonable default (consolidated, rolled up across entities, default amount column) and call out the assumption explicitly in `explanation`.
 - If the question cannot be answered because the data isn't there (no rows, missing column for a real query), return a SELECT that retrieves the closest available context, explain the limitation, and set `confidence` = "low". **Only use Low confidence for "data isn't here", never for "I didn't want to pick an interpretation".**
@@ -146,6 +178,24 @@ GROUP BY fin_year_period;
 ```
 Explanation: Interpreted as expense-as-percentage-of-revenue (the most common business reading of "diff in % between expenses and revenue"). Returns numerator (expense) and denominator (revenue) so the post-processor computes the ratio. Absolute values are used to give a clean magnitude in percent.
 post_process: ratio
+confidence: medium
+
+Q: "What is the percentage increase or decrease between Balance Sheet and Profit & Loss totals for FY 26-27?"
+SQL:
+```sql
+SELECT fin_year_period,
+       ABS(SUM(CASE WHEN gl_nature = 'Profit and Loss' THEN amount_consolidated END)) AS pl_total,
+       ABS(SUM(CASE WHEN gl_nature = 'Balance Sheet' THEN amount_consolidated END)) AS bs_total,
+       (ABS(SUM(CASE WHEN gl_nature = 'Profit and Loss' THEN amount_consolidated END))
+        - ABS(SUM(CASE WHEN gl_nature = 'Balance Sheet' THEN amount_consolidated END)))
+        / NULLIF(ABS(SUM(CASE WHEN gl_nature = 'Balance Sheet' THEN amount_consolidated END)), 0)
+        * 100 AS percent_change
+FROM ctb_data
+WHERE fin_year_period = 'FY 26-27'
+GROUP BY fin_year_period;
+```
+Explanation: The phrasing "percentage increase or decrease between X and Y" is a percent-change question (direction matters), not a ratio. Computed as (P&L − BS) / |BS| × 100. Negative result means P&L is smaller than BS in magnitude. Absolute values used because TB-convention signs would otherwise confuse the magnitude.
+post_process: none
 confidence: medium
 
 Q: "YoY change in revenue from FY 2024-25 to FY 2025-26?"
